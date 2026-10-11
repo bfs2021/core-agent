@@ -54,9 +54,10 @@ var ErrNoSmallModel = errors.New("background: no small-tier model configured")
 var ErrToolNotGranted = errors.New("background: tool not granted by predefined spec")
 
 // ErrAdhocDisabled is returned when the model attempts an ad-hoc
-// (inline-persona) spawn while allow_adhoc is off. The remedy is to
-// reference a configured subagent by name.
-var ErrAdhocDisabled = errors.New("background: ad-hoc subagents are disabled; reference a configured subagent by name")
+// (inline-persona) spawn while allow_adhoc is off. The remedy depends on
+// the roster, so it is not in the sentinel: adhocDisabledError wraps it
+// with the names to use, or with the fact that there are none.
+var ErrAdhocDisabled = errors.New("background: ad-hoc subagents are disabled")
 
 // RefOverrides are the narrowing-only adjustments a caller may layer on
 // top of a referenced predefined spec (#626). Every field is optional;
@@ -109,6 +110,36 @@ func (m *Manager) smallModel() string {
 	return m.smallModelID
 }
 
+// unknownSubagentError completes an ErrUnknownSubagent with the names
+// that DO resolve, or says there are none. A bare "unknown predefined
+// subagent" gave a parent nothing to go on, and one with no tools of its
+// own was seen guessing two dozen plausible names — k8s, sre, devops,
+// triage, oncall — a rejected spawn each. Caller must not hold m.mu.
+func (m *Manager) unknownSubagentError(name string) error {
+	if names := m.ReferenceNames(); len(names) > 0 {
+		return fmt.Errorf("%w: %q; the subagents that can be referenced by name are: %s",
+			ErrUnknownSubagent, name, joinNames(names))
+	}
+	if m.AllowAdhoc() {
+		return fmt.Errorf("%w: %q; no subagents are configured for reference by name here, so leave agent empty and describe the subagent inline with system_prompt",
+			ErrUnknownSubagent, name)
+	}
+	return fmt.Errorf("%w: %q; no subagents are configured for reference by name here, and inline subagents are disabled, so no spawn can succeed",
+		ErrUnknownSubagent, name)
+}
+
+// adhocDisabledError completes an ErrAdhocDisabled with the remedy that
+// is actually available. The fixed text said "reference a configured
+// subagent by name" even with none configured, which cost a guessed name
+// and a second rejection to learn that no spawn could succeed. Caller
+// must not hold m.mu.
+func (m *Manager) adhocDisabledError() error {
+	if names := m.ReferenceNames(); len(names) > 0 {
+		return fmt.Errorf("%w; reference a configured subagent by name instead: %s", ErrAdhocDisabled, joinNames(names))
+	}
+	return fmt.Errorf("%w, and no subagents are configured for reference by name here, so no spawn can succeed", ErrAdhocDisabled)
+}
+
 // AllowAdhoc reports whether ad-hoc (inline-persona) spawns are
 // permitted. False (the daemon default) means the model may only spawn
 // by reference to a predefined spec.
@@ -129,7 +160,7 @@ func (m *Manager) resolvePredefinedSpec(name string, ov RefOverrides) (Spec, err
 	smallModelID := m.smallModelID
 	m.mu.Unlock()
 	if !ok {
-		return Spec{}, fmt.Errorf("%w: %q", ErrUnknownSubagent, name)
+		return Spec{}, m.unknownSubagentError(name)
 	}
 
 	spec := base // struct copy; slices are shared but we reassign, never mutate in place
