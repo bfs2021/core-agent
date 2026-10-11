@@ -807,10 +807,10 @@ func run(prompt, initialPrompt, cfgPath, agentsDirFlag, modelOverride, providerO
 		return runner.ExitConfigError
 	}
 
-	// Vertex explicit context caching (#221 v1). Wire the cache
-	// manager BEFORE Model() is called — Provider.Model constructs
-	// the builtinsLLM wrapper that reads the cache hooks, so
-	// installing hooks after Model() would leave them dangling.
+	// Vertex explicit context caching (#221 v1). The hooks may be
+	// installed before or after Model(): gemini.Provider's models read
+	// them on every call. Wired here, ahead of Model(), so the first
+	// turn can already seed the cache.
 	//
 	// Gated three ways:
 	//   1. Provider must be *gemini.Provider (only Vertex/Gemini SDK).
@@ -818,8 +818,8 @@ func run(prompt, initialPrompt, cfgPath, agentsDirFlag, modelOverride, providerO
 	//      ON when the block is absent from config.json).
 	//   3. --no-context-cache CLI kill switch takes precedence.
 	//
-	// Failure to construct the sibling genai.Client is logged and
-	// caching is skipped — never breaks agent startup.
+	// Failure to build the caches client is logged and caching is
+	// skipped — never breaks agent startup.
 	contextCacheManager := compose.MaybeWireContextCache(
 		ctx, provider, cfg, noContextCache,
 		func(s string) { fmt.Fprintln(os.Stderr, "core-agent: "+s) },

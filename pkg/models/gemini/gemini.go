@@ -12,25 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package gemini implements models.Provider for the Gemini family,
-// covering both the public Gemini API (API-key auth) and Vertex AI
-// (Application Default Credentials + GCP project).
+// Package gemini implements models.Provider for Gemini, on the Gemini
+// Developer API ("gemini") and on Vertex AI ("vertex").
 //
-// The two are exposed as distinct provider names ("gemini" and "vertex")
-// so users and automation can pin to a backend explicitly. Both delegate
-// to google.golang.org/adk/v2/model/gemini under the hood.
+// The adapter lives in core-models (dialect/gemini,
+// docs/model-support-design.md): the genai-native model, the stream
+// aggregation, built-in injection and its pre-3.0 skip, the
+// IncludeServerSideToolInvocations flag set from the backend, the
+// empty-response retry and the Vertex context-cache stamping with its
+// eviction recovery. This package is core-agent's facade over it: it
+// maps config.Config onto the library's options, keeps core-agent's
+// defaults (built-ins web search and URL context on) and exported API,
+// keeps core-agent's own transient retry and its process-wide budget
+// (pkg/models.RetryPolicy) as the one retry layer, and adapts each
+// model to ADK v2 through models.Adapt.
 package gemini
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"iter"
 	"net/http"
 	"os"
+	"sync"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	adkmodel "google.golang.org/adk/v2/model"
-	adkgemini "google.golang.org/adk/v2/model/gemini"
 	"google.golang.org/genai"
+
+	"github.com/go-steer/core-models/auth"
+	cmgemini "github.com/go-steer/core-models/dialect/gemini"
+	"github.com/go-steer/core-models/llm"
+	"github.com/go-steer/core-models/retry"
 
 	"github.com/go-steer/core-agent/v3/pkg/config"
 	"github.com/go-steer/core-agent/v3/pkg/models"
@@ -44,21 +58,33 @@ func init() {
 // Provider is the Gemini-family implementation of models.Provider.
 type Provider struct {
 	name     string
-	cfg      *genai.ClientConfig
 	prefix   string
+	backend  genai.Backend
+	apiKey   string
+	project  string
+	location string
 	builtins BuiltinTools
+	baseURL  string           // tests only: the library's endpoint override
+	cred     *auth.Credential // tests only: Vertex credential in place of ADC
 
-	// cacheInit + cacheName are threaded into every builtinsLLM this
-	// Provider constructs; see WithContextCache. Only wired on Vertex
-	// in the current daemon flow — the direct Gemini API rejects the
-	// cache-reference parameter on some model families.
-	//
-	// cacheInvalidate is called when GenerateContent detects that
-	// Vertex has evicted the cache server-side (TTL elapsed on a
-	// long-lived daemon). Same Vertex-only gating as the other two.
+	// cacheModel, cacheInit, cacheName and cacheInvalidate wire Vertex
+	// explicit context caching into every model this Provider builds;
+	// see WithContextCache. The library applies them on Vertex only —
+	// the direct Gemini API rejects the cache-reference parameter on
+	// some model families — and only to requests for cacheModel.
+	cacheModel      string
 	cacheInit       ContextCacheInitFn
 	cacheName       ContextCacheNameFn
 	cacheInvalidate ContextCacheInvalidateFn
+
+	// client is the one core-models client every model shares, built on
+	// first use. The library takes context-cache hooks per Client, so
+	// installing hooks (SetContextCache, SetContextCacheInvalidate)
+	// drops it and the next call rebuilds it with them; models resolve
+	// the client per call (lateModel), so one returned before the hooks
+	// were installed still gets them. mu guards the hooks and client.
+	mu     sync.Mutex
+	client *cmgemini.Client
 }
 
 // Name reports the provider identity (e.g. "gemini" or "vertex").
@@ -75,68 +101,186 @@ const DefaultSmallModelID = "gemini-3.5-flash-lite"
 // requiring the operator to set --agentic-small-model.
 func (p *Provider) DefaultSmallModel() string { return DefaultSmallModelID }
 
-// Model constructs a model.LLM for the given model ID. When the
-// Provider has any built-in tools enabled, the returned LLM is
-// wrapped to inject them into Config.Tools on every request.
+// options is the library configuration for this Provider. Call with
+// p.mu held, or before the Provider is shared.
+func (p *Provider) options() cmgemini.Options {
+	o := cmgemini.Options{
+		Backend:      p.backend,
+		APIKey:       p.apiKey,
+		Project:      p.project,
+		Location:     p.location,
+		BaseURL:      p.baseURL,
+		BackendName:  p.name,
+		BuiltinTools: p.builtins.library(),
+		Logf:         func(format string, args ...any) { logf(format, args...) },
+		// Outbound calls get an HTTP client span and traceparent on both
+		// backends (#325). The library authenticates Vertex with its own
+		// ADC bearer transport over this one, so genai's own
+		// otelhttp-wrapped ADC client is not in the path to double-count.
+		HTTPClient:             &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport)},
+		Retry:                  geminiRetry(),
+		Credential:             p.cred,
+		ContextCacheModel:      p.cacheModel,
+		ContextCacheInit:       p.cacheInit,
+		ContextCacheName:       p.cacheName,
+		ContextCacheInvalidate: p.cacheInvalidate,
+	}
+	return o
+}
+
+// geminiRetry is the library's HTTP-layer policy for Gemini: one retry
+// layer, not two. transientRetry (pkg/models.RetryPolicy) keeps 429/503
+// and the bare-400-after-success retry, its process-wide budget, and the
+// RetryError a transcript shows (#1206), so the library re-sends
+// nothing — the bare-400 rule included, which a nil AfterSuccess would
+// bring back. What it keeps from retry.Default is the header timeout:
+// an attempt that gets no response headers in five minutes fails rather
+// than hanging the turn, and transientRetry decides what happens next.
+func geminiRetry() *retry.Policy {
+	pol := retry.Default()
+	pol.MaxRetries = 0
+	pol.AfterSuccess = func(int, []byte) bool { return false }
+	return &pol
+}
+
+// setHooks applies a hook change and drops the client, so the next
+// call rebuilds it with the hooks.
+func (p *Provider) setHooks(apply func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	apply()
+	p.client = nil
+}
+
+func (p *Provider) libClient(ctx context.Context) (*cmgemini.Client, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.client != nil {
+		return p.client, nil
+	}
+	c, err := cmgemini.New(ctx, p.options())
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", p.prefix, err)
+	}
+	p.client = c
+	return c, nil
+}
+
+// Caches returns the genai caches service on this Provider's endpoint
+// and credentials, for building a vertexcache.Manager (see
+// pkg/compose.MaybeWireContextCache) without a second copy of the
+// backend, project and auth detection. It is the shared client's; the
+// service stays usable after installing hooks replaces that client.
+func (p *Provider) Caches(ctx context.Context) (*genai.Caches, error) {
+	c, err := p.libClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return c.Caches(), nil
+}
+
+// Model constructs a model.LLM for the given model ID. The client is
+// built here, so a missing credential fails at startup rather than on
+// the first turn.
 func (p *Provider) Model(ctx context.Context, modelID string) (adkmodel.LLM, error) {
 	if modelID == "" {
 		return nil, fmt.Errorf("%s: model id is required", p.prefix)
 	}
-	llm, err := adkgemini.NewModel(ctx, modelID, p.cfg)
-	if err != nil {
-		return nil, fmt.Errorf("%s: new model %q: %w", p.prefix, modelID, err)
+	if _, err := p.libClient(ctx); err != nil {
+		return nil, err
 	}
-	isVertex := p.cfg != nil && p.cfg.Backend == genai.BackendVertexAI
-	// Cache hooks are only threaded on Vertex — the direct Gemini API
-	// may reject the CachedContent reference parameter on some model
-	// families, and #221's v1 scope is Vertex-only anyway.
-	var initFn ContextCacheInitFn
-	var nameFn ContextCacheNameFn
-	var invalidateFn ContextCacheInvalidateFn
-	if isVertex {
-		initFn = p.cacheInit
-		nameFn = p.cacheName
-		invalidateFn = p.cacheInvalidate
+	return newRetrying(models.Adapt(lateModel{p: p, id: modelID})), nil
+}
+
+// lateModel is one model id on whatever client the Provider holds at
+// call time, so hooks installed after Model() still apply.
+type lateModel struct {
+	p    *Provider
+	id   string
+	bare bool // without server-side built-ins
+}
+
+func (m lateModel) Name() string { return m.id }
+
+func (m lateModel) GenerateContent(ctx context.Context, req *llm.Request, stream bool) iter.Seq2[*llm.Response, error] {
+	return func(yield func(*llm.Response, error) bool) {
+		c, err := m.p.libClient(ctx)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		lm := c.Model(m.id)
+		if wb, ok := lm.(interface{ WithoutBuiltins() llm.LLM }); ok && m.bare {
+			lm = wb.WithoutBuiltins()
+		}
+		for resp, err := range lm.GenerateContent(ctx, req, stream) {
+			if !yield(resp, err) {
+				return
+			}
+		}
 	}
-	if tools := p.builtins.asTools(); len(tools) > 0 {
-		return &builtinsLLM{
-			inner:    llm,
-			builtins: tools,
-			// Direct Gemini API (BackendGeminiAPI) requires the
-			// IncludeServerSideToolInvocations flag when combining
-			// built-ins with function tools. Vertex AI rejects the
-			// flag with "includeServerSideToolInvocations parameter
-			// is not supported in Gemini Enterprise Agent Platform
-			// (previously known as Vertex AI)" — it permits the
-			// combination unconditionally instead.
-			isDirectGeminiAPI: p.cfg != nil && p.cfg.Backend == genai.BackendGeminiAPI,
-			// Vertex's streaming search-grounding path intermittently
-			// emits chunks with empty Candidates[] (heartbeat-like,
-			// carrying only UsageMetadata/ResponseID). ADK's stream
-			// aggregator surfaces these as "empty response" errors
-			// and aborts the stream. Tolerate the heartbeats so the
-			// remaining grounded chunks can come through.
-			tolerateEmptyChunks: isVertex,
-			cacheInit:           initFn,
-			cacheName:           nameFn,
-			cacheInvalidate:     invalidateFn,
-		}, nil
+}
+
+// WithoutBuiltins is the same model without server-side built-ins.
+func (m lateModel) WithoutBuiltins() llm.LLM { return lateModel{p: m.p, id: m.id, bare: true} }
+
+// transientRetry is the one retry layer for Gemini: 429 and 503, and
+// Vertex's bare 400 once the session has been served (#898, #1247),
+// against pkg/models' process-wide budget. The predicates are the
+// library's, so its error classification and this policy agree.
+var transientRetry = &models.RetryPolicy{
+	IsTransient:             cmgemini.IsTransient,
+	IsTransientAfterSuccess: cmgemini.IsBareInvalidArgument,
+	Log:                     func(format string, args ...any) { logf(format, args...) },
+}
+
+// IsTransient reports whether err is a Gemini rate limit or overload
+// worth retrying. It is the library's classification.
+func IsTransient(err error) bool { return cmgemini.IsTransient(err) }
+
+// IsBareInvalidArgument reports whether err is Vertex's detail-less
+// 400 INVALID_ARGUMENT. It is the library's classification.
+func IsBareInvalidArgument(err error) bool { return cmgemini.IsBareInvalidArgument(err) }
+
+// retrying runs every call under transientRetry, and maps the library's
+// empty-response error onto ErrEmptyResponse, which callers recognize
+// through models.ErrEmptyResponse.
+type retrying struct {
+	inner adkmodel.LLM
+}
+
+// newRetrying wraps m, keeping the WithoutBuiltins unwrap when m has it.
+func newRetrying(m adkmodel.LLM) adkmodel.LLM {
+	r := retrying{inner: m}
+	if _, ok := m.(interface{ WithoutBuiltins() adkmodel.LLM }); ok {
+		return retryingWithBuiltins{r}
 	}
-	if isVertex {
-		return &builtinsLLM{
-			inner:               llm,
-			tolerateEmptyChunks: true,
-			cacheInit:           initFn,
-			cacheName:           nameFn,
-			cacheInvalidate:     invalidateFn,
-		}, nil
-	}
-	// Wrapped even with nothing to add, for the empty-tail detection.
-	// ADK v1.7.0's stream aggregator stopped erroring on a stream of
-	// candidate-less chunks; it now yields a final event with no
-	// parts, which unwrapped would end the turn silently (the #220
-	// shape). The wrapper turns that into ErrEmptyResponse.
-	return &builtinsLLM{inner: llm}, nil
+	return r
+}
+
+func (r retrying) Name() string { return r.inner.Name() }
+
+func (r retrying) GenerateContent(ctx context.Context, req *adkmodel.LLMRequest, stream bool) iter.Seq2[*adkmodel.LLMResponse, error] {
+	return transientRetry.Wrap(ctx, func() iter.Seq2[*adkmodel.LLMResponse, error] {
+		return func(yield func(*adkmodel.LLMResponse, error) bool) {
+			for resp, err := range r.inner.GenerateContent(ctx, req, stream) {
+				if errors.Is(err, llm.ErrEmptyResponse) {
+					err = fmt.Errorf("%w [%w]", ErrEmptyResponse, err)
+				}
+				if !yield(resp, err) {
+					return
+				}
+			}
+		}
+	})
+}
+
+type retryingWithBuiltins struct{ retrying }
+
+// WithoutBuiltins returns the model without its server-side built-ins,
+// still under the retry layer — see the duck type RunSubtask uses.
+func (r retryingWithBuiltins) WithoutBuiltins() adkmodel.LLM {
+	return newRetrying(r.inner.(interface{ WithoutBuiltins() adkmodel.LLM }).WithoutBuiltins())
 }
 
 // NewAPIKey returns a Provider authenticated against the public Gemini API
@@ -149,21 +293,10 @@ func NewAPIKey(key string, opts ...Option) (*Provider, error) {
 		return nil, fmt.Errorf("gemini: api key is required (set GOOGLE_API_KEY or GEMINI_API_KEY, or model.api_key in .agents/config.json)")
 	}
 	p := &Provider{
-		name:   config.ProviderGemini,
-		prefix: "gemini",
-		cfg: &genai.ClientConfig{
-			APIKey:  key,
-			Backend: genai.BackendGeminiAPI,
-			// Without an explicit HTTPClient, genai falls back to a bare
-			// http.Client with no tracing, so outbound calls to
-			// generativelanguage.googleapis.com would produce no HTTP
-			// client span and no traceparent (#325). Supplying one is
-			// safe on this backend only: API-key auth is a per-request
-			// header genai sets itself, independent of the transport.
-			HTTPClient: &http.Client{
-				Transport: otelhttp.NewTransport(http.DefaultTransport),
-			},
-		},
+		name:     config.ProviderGemini,
+		prefix:   "gemini",
+		backend:  genai.BackendGeminiAPI,
+		apiKey:   key,
 		builtins: DefaultBuiltinTools(),
 	}
 	for _, opt := range opts {
@@ -182,21 +315,11 @@ func NewVertex(project, location string, opts ...Option) (*Provider, error) {
 		return nil, fmt.Errorf("vertex: project and location are required (set model.vertex.{project,location} in .agents/config.json or GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION env vars)")
 	}
 	p := &Provider{
-		name:   config.ProviderVertex,
-		prefix: "vertex",
-		cfg: &genai.ClientConfig{
-			Backend:  genai.BackendVertexAI,
-			Project:  project,
-			Location: location,
-			// No HTTPClient here, deliberately (#325). With it nil,
-			// genai detects ADC and builds its client via
-			// cloud.google.com/go/auth/httptransport, which wraps the
-			// transport in otelhttp by default — outbound Vertex calls
-			// already get an HTTP client span + traceparent. Setting
-			// HTTPClient would BOTH double-instrument and skip genai's
-			// ADC path entirely, breaking auth (genai only wires
-			// credentials into a client it builds itself).
-		},
+		name:     config.ProviderVertex,
+		prefix:   "vertex",
+		backend:  genai.BackendVertexAI,
+		project:  project,
+		location: location,
 		builtins: DefaultBuiltinTools(),
 	}
 	for _, opt := range opts {
