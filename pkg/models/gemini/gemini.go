@@ -85,6 +85,13 @@ type Provider struct {
 	// were installed still gets them. mu guards the hooks and client.
 	mu     sync.Mutex
 	client *cmgemini.Client
+	// models caches the library model per id for the current client.
+	// core-models hands back a fresh model from every Client.Model call,
+	// and its once-per-model state (the "built-ins skipped for this
+	// model" notice) would otherwise reset on every turn. The library
+	// model is immutable apart from that sync.Once, so concurrent calls
+	// share it. Dropped with the client.
+	models map[string]llm.LLM
 }
 
 // Name reports the provider identity (e.g. "gemini" or "vertex").
@@ -150,6 +157,32 @@ func (p *Provider) setHooks(apply func()) {
 	defer p.mu.Unlock()
 	apply()
 	p.client = nil
+	p.models = nil
+}
+
+// libModel returns the library model for id on the current client,
+// built once per client.
+func (p *Provider) libModel(ctx context.Context, id string) (llm.LLM, error) {
+	c, err := p.libClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.client != c {
+		// Hooks replaced the client between the two locks. Serve this
+		// call from the client it got; the next call caches on the new one.
+		return c.Model(id), nil
+	}
+	if lm, ok := p.models[id]; ok {
+		return lm, nil
+	}
+	if p.models == nil {
+		p.models = map[string]llm.LLM{}
+	}
+	lm := c.Model(id)
+	p.models[id] = lm
+	return lm, nil
 }
 
 func (p *Provider) libClient(ctx context.Context) (*cmgemini.Client, error) {
@@ -204,12 +237,11 @@ func (m lateModel) Name() string { return m.id }
 
 func (m lateModel) GenerateContent(ctx context.Context, req *llm.Request, stream bool) iter.Seq2[*llm.Response, error] {
 	return func(yield func(*llm.Response, error) bool) {
-		c, err := m.p.libClient(ctx)
+		lm, err := m.p.libModel(ctx, m.id)
 		if err != nil {
 			yield(nil, err)
 			return
 		}
-		lm := c.Model(m.id)
 		if wb, ok := lm.(interface{ WithoutBuiltins() llm.LLM }); ok && m.bare {
 			lm = wb.WithoutBuiltins()
 		}

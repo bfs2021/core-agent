@@ -330,6 +330,37 @@ func TestFacade_HooksInstalledAfterModelStillApply(t *testing.T) {
 	}
 }
 
+// TestFacade_BuiltinsSkippedNoticeOncePerModel: the library logs once
+// per model handle when a pre-3.0 model cannot mix built-ins with
+// function tools. It hands back a fresh handle from every Client.Model
+// call, so resolving the model per call (lateModel) repeated the line
+// on every turn. Not parallel: captureLogf swaps a package global.
+func TestFacade_BuiltinsSkippedNoticeOncePerModel(t *testing.T) {
+	logs := captureLogf(t)
+	f := newFakeGenerate(t)
+	p, err := NewAPIKey("test-key")
+	if err != nil {
+		t.Fatalf("NewAPIKey: %v", err)
+	}
+	p.baseURL = f.srv.URL
+	m, err := p.Model(context.Background(), "gemini-2.5-flash")
+	if err != nil {
+		t.Fatalf("Model: %v", err)
+	}
+	for range 3 {
+		generateOnce(t, context.Background(), m)
+	}
+	n := 0
+	for _, l := range *logs {
+		if strings.Contains(l, "predates mixed built-in + function tools") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("built-ins-skipped notice logged %d times over 3 calls, want once:\n%s", n, strings.Join(*logs, "\n"))
+	}
+}
+
 // TestFacade_CachesSharesTheClient: building the cache manager reuses
 // the Provider's client rather than opening a second one.
 func TestFacade_CachesSharesTheClient(t *testing.T) {

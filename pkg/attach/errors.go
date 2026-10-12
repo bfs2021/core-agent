@@ -110,6 +110,22 @@ func classifyTurnError(err error) TurnError {
 			Retryable: true,
 		}
 	}
+	// The provider library's retry transport gives up on a request that
+	// sent no response headers within its header timeout, and it wraps
+	// the context.Canceled its own timer caused with %w — so the error
+	// matches the cancel arm below and would read as an operator stop:
+	// no auto-continue re-drive, and a pending guardrail blamed for the
+	// cut. Nobody asked for it, so it is the deadline case, not the
+	// cancel one. Matched by text because this package stays free of
+	// provider dependencies; the test builds the real error.
+	if strings.Contains(err.Error(), "no response headers within the header timeout") {
+		return TurnError{
+			Kind:      TurnErrorTransientNet,
+			Code:      "HEADER_TIMEOUT",
+			Message:   "model sent no response within the header timeout",
+			Retryable: true,
+		}
+	}
 	// A cancel is a deliberate stop, never a failure to retry: an
 	// operator interrupt, a shutdown, or a guardrail cutting the turn
 	// short. Note the asymmetry with the deadline above — that one is
