@@ -212,14 +212,14 @@ func contextWindowSizeFor(model string) int {
 		return 1_000_000
 	case containsAny(model, "claude-opus-4", "claude-sonnet-4", "claude-haiku-4"):
 		// Earlier Claude 4.x, reached only by ids the catalog does not
-		// publish. Opus 4.0/4.1/4.5 and Haiku 4.x really are 200K; the
-		// Sonnet 4/4.5 line went to 1M upstream on 2026-09-17, and
-		// every spelling LiteLLM publishes for it answers from the
-		// generated tier above — so a Sonnet id that gets this far is
-		// one nobody has published a window for, and 200K is the
-		// deliberate answer to that rather than a claim about the
-		// model: under-estimating compacts early, over-estimating dies
-		// on a context-length error. The "-1m" suffix is still honored
+		// publish. Opus 4.0/4.1/4.5 and Haiku 4.x really are 200K.
+		// Sonnet 4.5's catalog window has gone 200K → 1M (2026-09-17)
+		// → 200K (2026-10-12), and every spelling LiteLLM publishes for
+		// it answers from the generated tier above — so a Sonnet id
+		// that gets this far is one nobody has published a window
+		// for, and 200K is the deliberate answer to that rather than a
+		// claim about the model: under-estimating compacts early,
+		// over-estimating dies on a context-length error. The "-1m" suffix is still honored
 		// when an operator spells one out, even though upstream no
 		// longer carries any such key.
 		if containsAny(model, "-1m") {
