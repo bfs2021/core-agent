@@ -16,6 +16,10 @@ The `extras/` adapters (`extras/scion-agent/`, `extras/ax-agent/`) and the `inte
 
 ## [Unreleased]
 
+_No unreleased changes since [3.0.0-dev.1]._
+
+## [3.0.0-dev.1] — 2026-10-12
+
 ### Breaking Changes
 
 - **The module path is now `github.com/go-steer/core-agent/v3`.** Go's semantic import versioning makes the `/vN` suffix what decides whether a `vN` tag can be installed at all, so it moves before the first 3.0 tag. Without it, `v3.0.0-dev.1` would join v2.0.0–v2.7.0-dev.4 as a tag `go install` can never resolve (#327). To upgrade, rewrite imports `github.com/go-steer/core-agent/v2/...` → `github.com/go-steer/core-agent/v3/...`, together with the ADK v2 move below, and install with `go install github.com/go-steer/core-agent/v3/cmd/core-agent@latest`. Consumers pinned to a v2.x tag keep the `/v2` path and are unaffected. Container images and source builds never depended on the suffix. The in-source fallback version is now `v3.0.0-dev`, and `verify-version-fallback` reads the major from `go.mod`, so the path and the fallback can no longer disagree. ([#1312](https://github.com/go-steer/core-agent/pull/1312))
