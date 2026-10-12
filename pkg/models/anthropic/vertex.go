@@ -16,10 +16,11 @@ package anthropic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"strings"
 
+	"github.com/go-steer/core-models/auth"
 	"github.com/go-steer/core-models/profile"
 
 	"github.com/go-steer/core-agent/v3/pkg/config"
@@ -62,17 +63,23 @@ func NewVertex(ctx context.Context, project, region string, opts ...Option) (*Pr
 	prof.Params = map[string]string{"project": project, "region": region}
 	p := &Provider{name: config.ProviderAnthropicVertex, prof: prof}
 	out, err := p.init(ctx, opts)
-	if err != nil && strings.Contains(err.Error(), "Application Default Credentials") {
+	if noADC(err) {
 		// The wording operators (and the ADC-less CI skip guards) know.
-		// Matched on text because core-models' auth package exports no
-		// sentinel or type for missing ADC; its error says "auth: no
-		// Google Application Default Credentials: …".
 		return nil, fmt.Errorf("anthropic-vertex: load default credentials: %w (run `gcloud auth application-default login`)", err)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("anthropic-vertex: %w", err)
 	}
 	return out, nil
+}
+
+// noADC reports whether err is core-models' missing-ADC failure. The
+// sentinel holds through profile.Resolve from core-models v0.6.5 (v0.6.4
+// re-wrapped the auth error with %v and dropped it);
+// TestNewVertex_MissingADCGetsTheOperatorWording fails if a release ever
+// breaks the chain again.
+func noADC(err error) bool {
+	return errors.Is(err, auth.ErrNoADC)
 }
 
 // newVertexProvider is the registry constructor for "anthropic-vertex".

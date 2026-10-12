@@ -51,7 +51,8 @@ func TestClassifyTurnError_HeaderTimeoutIsTransientNotCanceled(t *testing.T) {
 
 	pol := retry.Default()
 	pol.MaxRetries = 0
-	pol.HeaderTimeout = 200 * time.Millisecond
+	pol.HeaderTimeout = 200 * time.Millisecond      // streaming
+	pol.UnaryHeaderTimeout = 200 * time.Millisecond // non-streaming (core-models v0.6.4+)
 	c, err := cmgemini.New(context.Background(), cmgemini.Options{
 		Backend: genai.BackendGeminiAPI, APIKey: "test", BaseURL: srv.URL, Retry: &pol,
 	})

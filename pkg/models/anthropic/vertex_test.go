@@ -91,3 +91,22 @@ func TestNewVertexProvider_HonorsEnvFallbacks(t *testing.T) {
 		t.Fatalf("env fallback path should reach the creds load step, got %v", err)
 	}
 }
+
+// TestNewVertex_MissingADCGetsTheOperatorWording forces the no-ADC path
+// on any machine, ADC or not, so the operator-facing wording (and the
+// "load default credentials" text the ADC-less skip guards above key
+// on) can't silently disappear. It did once: matching core-models'
+// auth.ErrNoADC with errors.Is alone missed, because profile.Resolve
+// re-wraps the auth error with %v. Not parallel: t.Setenv.
+func TestNewVertex_MissingADCGetsTheOperatorWording(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", t.TempDir()+"/missing.json")
+	_, err := NewVertex(context.Background(), "my-project", "us-east5")
+	if err == nil {
+		t.Fatal("NewVertex succeeded with no credentials")
+	}
+	for _, want := range []string{"load default credentials", "gcloud auth application-default login"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("missing-ADC error lacks %q: %v", want, err)
+		}
+	}
+}

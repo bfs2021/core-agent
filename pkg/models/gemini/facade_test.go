@@ -137,6 +137,13 @@ func TestFacade_OneRetryLayer(t *testing.T) {
 	if o.Retry.HeaderTimeout != retry.Default().HeaderTimeout || o.Retry.HeaderTimeout == 0 {
 		t.Errorf("HeaderTimeout = %v, want retry.Default()'s %v — a silent server would hang the turn", o.Retry.HeaderTimeout, retry.Default().HeaderTimeout)
 	}
+	// Non-streaming calls (the compaction summarizer, titles, the
+	// approver) get no headers until the whole answer exists, so they
+	// wait UnaryHeaderTimeout instead. A hand-built Policy leaves it 0,
+	// which the library reads as no limit.
+	if o.Retry.UnaryHeaderTimeout != retry.Default().UnaryHeaderTimeout || o.Retry.UnaryHeaderTimeout == 0 {
+		t.Errorf("UnaryHeaderTimeout = %v, want retry.Default()'s %v", o.Retry.UnaryHeaderTimeout, retry.Default().UnaryHeaderTimeout)
+	}
 	if o.Retry.AfterSuccess == nil || o.Retry.AfterSuccess(400, []byte(`{"error":{"code":400,"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT"}}`)) {
 		t.Error("the library's bare-400 rule is on; it would retry beside transientRetry")
 	}
