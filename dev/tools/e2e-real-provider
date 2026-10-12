@@ -44,13 +44,44 @@
 # A leg whose credentials ARE present must pass; smoke-script exit 77
 # (its own skip convention) is treated as skipped, anything else
 # non-zero fails the run.
+#
+# E2E_LEGS picks which legs run (comma-separated; default: all). The
+# weekly workflow splits them across two jobs, so a provider regression
+# and a model-behaviour miss show up as different red jobs:
+#   provider legs — vertex-gemini, vertex-anthropic (wire / provider)
+#   model evals   — evals-corpus, approver-evals    (model behaviour)
+# Under GitHub Actions a failed leg also raises an ::error annotation
+# naming its kind, and every run appends a results table to
+# $GITHUB_STEP_SUMMARY (per eval case for the corpus).
 
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
+ALL_LEGS="vertex-gemini,vertex-anthropic,evals-corpus,approver-evals"
+LEGS="${E2E_LEGS:-$ALL_LEGS}"
+for l in ${LEGS//,/ }; do
+  case ",${ALL_LEGS}," in
+    *",${l},"*) ;;
+    *) echo "e2e-real-provider: unknown leg '${l}' in E2E_LEGS (known: ${ALL_LEGS})" >&2; exit 2 ;;
+  esac
+done
+want_leg() { [[ ",${LEGS}," == *",$1,"* ]]; }
+
+leg_kind() {
+  case "$1" in
+    evals-corpus|approver-evals) echo "model behaviour" ;;
+    *) echo "provider/wire regression" ;;
+  esac
+}
+
 ran=0
 failed=0
 self_skipped=0
+summary_rows=()
+# Reports older than this run (a local re-run, an earlier EVAL_CASE)
+# stay out of the summary.
+START_MARK=$(mktemp "${TMPDIR:-/tmp}/e2e-real-provider-start-XXXX")
+trap 'rm -f "${START_MARK}"' EXIT
 
 run_leg() {
   local name="$1" script="$2"
@@ -58,35 +89,110 @@ run_leg() {
   bash "${script}"
   local rc=$?
   case "${rc}" in
-    0)  ran=$((ran+1)) ;;
-    77) echo "e2e-real-provider: ${name}: skipped by script (exit 77)"; self_skipped=$((self_skipped+1)) ;;
-    *)  echo "e2e-real-provider: ${name}: FAILED (exit ${rc})" >&2; failed=$((failed+1)) ;;
+    0)  ran=$((ran+1)); summary_rows+=("| ${name} | $(leg_kind "${name}") | ✅ pass |") ;;
+    77) echo "e2e-real-provider: ${name}: skipped by script (exit 77)"; self_skipped=$((self_skipped+1))
+        summary_rows+=("| ${name} | $(leg_kind "${name}") | ⏭ skipped by script |") ;;
+    *)  echo "e2e-real-provider: ${name}: FAILED (exit ${rc})" >&2; failed=$((failed+1))
+        summary_rows+=("| ${name} | $(leg_kind "${name}") | ❌ **FAILED** (exit ${rc}) |")
+        if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+          echo "::error title=${name} failed ($(leg_kind "${name}"))::${name} exited ${rc}; see the job summary and the leg's output"
+        fi ;;
   esac
 }
 
-if [[ -n "${GOOGLE_CLOUD_PROJECT:-}" ]]; then
-  run_leg "vertex-gemini" dev/smoke/02-vertex-basic.sh
-else
-  echo "e2e-real-provider: vertex-gemini: skipped (GOOGLE_CLOUD_PROJECT unset)"
+skip_leg() {
+  echo "e2e-real-provider: $1: skipped ($2)"
+  summary_rows+=("| $1 | $(leg_kind "$1") | ⏭ skipped ($2) |")
+}
+
+if want_leg vertex-gemini; then
+  if [[ -n "${GOOGLE_CLOUD_PROJECT:-}" ]]; then
+    run_leg "vertex-gemini" dev/smoke/02-vertex-basic.sh
+  else
+    skip_leg vertex-gemini "GOOGLE_CLOUD_PROJECT unset"
+  fi
 fi
 
-if [[ -n "${ANTHROPIC_VERTEX_PROJECT_ID:-}" ]]; then
-  run_leg "vertex-anthropic" dev/smoke/09-vertex-anthropic-toolloop.sh
-else
-  echo "e2e-real-provider: vertex-anthropic: skipped (ANTHROPIC_VERTEX_PROJECT_ID unset)"
+if want_leg vertex-anthropic; then
+  if [[ -n "${ANTHROPIC_VERTEX_PROJECT_ID:-}" ]]; then
+    run_leg "vertex-anthropic" dev/smoke/09-vertex-anthropic-toolloop.sh
+  else
+    skip_leg vertex-anthropic "ANTHROPIC_VERTEX_PROJECT_ID unset"
+  fi
 fi
 
-if [[ -n "${ANTHROPIC_VERTEX_PROJECT_ID:-}" ]]; then
-  run_leg "evals-corpus" dev/smoke/11-evals-corpus.sh
-else
-  echo "e2e-real-provider: evals-corpus: skipped (ANTHROPIC_VERTEX_PROJECT_ID unset)"
+if want_leg evals-corpus; then
+  if [[ -n "${ANTHROPIC_VERTEX_PROJECT_ID:-}" ]]; then
+    run_leg "evals-corpus" dev/smoke/11-evals-corpus.sh
+  else
+    skip_leg evals-corpus "ANTHROPIC_VERTEX_PROJECT_ID unset"
+  fi
 fi
 
-if [[ -n "${ANTHROPIC_VERTEX_PROJECT_ID:-}" ]]; then
-  run_leg "approver-evals" dev/smoke/12-approver-evals.sh
-else
-  echo "e2e-real-provider: approver-evals: skipped (ANTHROPIC_VERTEX_PROJECT_ID unset)"
+if want_leg approver-evals; then
+  if [[ -n "${ANTHROPIC_VERTEX_PROJECT_ID:-}" ]]; then
+    run_leg "approver-evals" dev/smoke/12-approver-evals.sh
+  else
+    skip_leg approver-evals "ANTHROPIC_VERTEX_PROJECT_ID unset"
+  fi
 fi
+
+# The job summary: one row per leg, then one row per eval case from
+# evalrun's JSON reports (the per-check detail is in the leg output).
+# A tools-tier check that failed is a model-behaviour miss; an unmet
+# precondition or a check that observed nothing is INDETERMINATE (the
+# case did not test what it claims); the no-access baseline must score
+# zero.
+summary_jq() {
+  cat <<'JQ'
+(.results[] | select(.tier == "tools")) as $t
+| (.results[] | select(.tier == "no-access")) as $b
+| ([$t.preconditions[]? | select(.passed != true or .vacuous == true) | .name]) as $unmet
+| ([$t.checks[] | select(.passed != true and .vacuous != true) | .name]) as $fail
+| ([$t.checks[] | select(.vacuous == true) | .name]) as $vac
+| ([$b.checks[] | select(.passed == true and .vacuous != true) | .name]) as $scored
+| "| \($t.case_id) | "
+  + (if ($t.run_error // "") != "" then "❌ run error: \($t.run_error | .[0:120])"
+     elif ($unmet | length) > 0 then "⚠️ INDETERMINATE (precondition: \($unmet | join(", ")))"
+     elif ($fail | length) > 0 then "❌ **FAIL**: \($fail | join(", "))"
+     elif ($vac | length) > 0 then "⚠️ INDETERMINATE (observed nothing: \($vac | join(", ")))"
+     else "✅ pass" end)
+  + " | "
+  + (if ($scored | length) > 0 then "❌ scored \($scored | length) (\($scored | join(", ")))"
+     elif ($b.timed_out // false) then "✅ held (stopped by deadline; zero is a lower bound)"
+     else "✅ held" end)
+  + " |"
+JQ
+}
+
+write_summary() {
+  [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+  {
+    echo "### e2e-real-provider (${LEGS})"
+    echo
+    echo "| leg | kind | result |"
+    echo "|---|---|---|"
+    printf '%s\n' "${summary_rows[@]}"
+    local reports="${TMPDIR:-/tmp}/core-agent-eval-reports" fresh=() r
+    if want_leg evals-corpus && command -v jq >/dev/null; then
+      for r in "${reports}"/*.json; do
+        [[ -f "$r" && "$(basename "$r")" != approver-* && "$r" -nt "${START_MARK}" ]] && fresh+=("$r")
+      done
+    fi
+    if [[ ${#fresh[@]} -gt 0 ]]; then
+      echo
+      echo "#### eval cases"
+      echo
+      echo "| case | with tools | no-access baseline |"
+      echo "|---|---|---|"
+      for r in "${fresh[@]}"; do
+        jq -r -f <(summary_jq) "$r" 2>/dev/null || echo "| $(basename "$r" .json) | (report unreadable) | |"
+      done
+    fi
+    echo
+  } >> "${GITHUB_STEP_SUMMARY}"
+}
+write_summary
 
 if [[ "${failed}" -gt 0 ]]; then
   echo "e2e-real-provider: ${failed} leg(s) FAILED" >&2
