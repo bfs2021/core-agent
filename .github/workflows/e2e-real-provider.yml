@@ -41,6 +41,16 @@
 # and guard the provider-regression class (wire-format drift, thinking
 # round-trip, tool-loop pairing), which moves with provider releases,
 # not with every commit. workflow_dispatch covers on-demand runs.
+#
+# Two jobs, so the kind of failure is in the red job's name:
+#   provider legs — Gemini and the Claude tool loop via Vertex. Red here
+#                   means a request shape stopped being accepted: wire or
+#                   provider breakage, ours or theirs.
+#   model evals   — the behavioural corpus and the approver corpus. Red
+#                   here usually means the model did not behave (a check
+#                   failed or a case was INDETERMINATE), not that the code
+#                   broke; read the per-case table in the run summary.
+# Both stay red on failure: a model-behaviour miss is still a miss.
 
 name: E2E real provider
 
@@ -55,11 +65,21 @@ permissions:
 
 jobs:
   e2e-real-provider:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: provider legs
+            legs: vertex-gemini,vertex-anthropic
+          - name: model evals
+            legs: evals-corpus,approver-evals
     # The evals legs run several model turns per tier; a full local run
     # took ~20 minutes, past the old 15.
     timeout-minutes: 35
     env:
+      E2E_LEGS: ${{ matrix.legs }}
       HAS_WIF: ${{ secrets.CORE_AGENT_E2E_WIF_PROVIDER != '' && secrets.CORE_AGENT_E2E_SERVICE_ACCOUNT != '' }}
       GOOGLE_CLOUD_PROJECT: ${{ vars.GOOGLE_CLOUD_PROJECT }}
       GOOGLE_GENAI_USE_VERTEXAI: 'true'
