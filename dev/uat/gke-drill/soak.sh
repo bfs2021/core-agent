@@ -361,7 +361,9 @@ soak_cleanup() {
     soak_summarize || true
     soak_note "artifacts: ${SOAK_RUN_DIR}"
 }
-trap soak_cleanup EXIT INT TERM
+# Not `trap soak_cleanup EXIT INT TERM`: soak_cleanup does not exit, so a
+# SIGTERM would run it and resume the loop (lib.sh says why).
+drill_trap_cleanup soak_cleanup
 
 # ── Summary ──────────────────────────────────────────────────────────
 

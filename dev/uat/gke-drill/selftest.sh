@@ -969,6 +969,84 @@ else
     bad "soak.sh no longer preflights kubectl top; an absent metrics-server reads as a flat memory line"
 fi
 
+head_ "Signals end the run"
+# On 2026-10-13 a soak "stopped" with SIGTERM ran its cleanup and then
+# kept breaking the cluster for four hours: `trap FN EXIT INT TERM` runs
+# FN on the signal and RESUMES the script, and soak_cleanup does not exit.
+# So this is checked by running real bash and signalling it, not by
+# reading the trap line. The probe evals drill_trap_cleanup's own body
+# out of lib.sh (sourcing lib.sh would run its tool and prereqs checks),
+# installs a cleanup that appends to a marker file, loops, and is sent the
+# signal. `set -m` matters: without job control a background job starts
+# with SIGINT ignored, bash cannot trap a signal ignored at entry, and the
+# INT case would fail for a reason that has nothing to do with lib.sh.
+#
+# trap_probe MODE SIG prints "<exit status> <cleanup runs>", or "hung <runs>"
+# when the process outlives five seconds. MODE helper uses lib.sh's
+# function; MODE legacy is the old `trap FN EXIT INT TERM`, a negative
+# control proving the probe can see the bug at all.
+TRAP_HELPER=$(sed -n '/^drill_trap_cleanup() {$/,/^}$/p' lib.sh)
+trap_probe() {
+    local mode=$1 sig=$2 dir pid rc n i
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/gke-drill-trap.XXXXXX")
+    set -m
+    bash -c '
+        eval "$1"
+        d=$2
+        cleanup() { echo ran >> "${d}/marker"; }
+        if [[ $3 == legacy ]]; then trap cleanup EXIT INT TERM; else drill_trap_cleanup cleanup; fi
+        : > "$2/ready"
+        [[ $4 == none ]] && exit 0
+        while :; do sleep 0.1; done
+    ' probe "${TRAP_HELPER}" "${dir}" "${mode}" "${sig}" &
+    pid=$!
+    set +m
+    for i in $(seq 50); do [[ -e "${dir}/ready" ]] && break; sleep 0.1; done
+    [[ "${sig}" == none ]] || kill -s "${sig}" "${pid}" 2>/dev/null || true
+    for i in $(seq 50); do kill -0 "${pid}" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "${pid}" 2>/dev/null; then
+        kill -s KILL "${pid}" 2>/dev/null
+        wait "${pid}" 2>/dev/null || true
+        rc=hung
+    else
+        rc=0; wait "${pid}" 2>/dev/null || rc=$?
+    fi
+    n=$(grep -c '^ran$' "${dir}/marker" 2>/dev/null || true)
+    rm -rf "${dir}"
+    printf '%s %s\n' "${rc}" "${n:-0}"
+}
+if [[ -z "${TRAP_HELPER}" ]]; then
+    bad "lib.sh no longer defines drill_trap_cleanup() as this check expects"
+else
+    for c in "TERM:143 1" "INT:130 1" "none:0 1"; do
+        got=$(trap_probe helper "${c%%:*}")
+        if [[ "${got}" == "${c#*:}" ]]; then
+            ok "drill_trap_cleanup: ${c%%:*} ends the script (status ${got% *}), cleanup ran once"
+        else
+            bad "drill_trap_cleanup: ${c%%:*} gave '${got}', want '${c#*:}' (status, cleanup runs)"
+        fi
+    done
+    got=$(trap_probe legacy TERM)
+    if [[ "${got}" == hung* ]]; then
+        ok "negative control: the old \`trap FN EXIT INT TERM\` survives SIGTERM, so the probe can see the bug"
+    else
+        bad "negative control: the old trap form gave '${got}', not hung; the probe cannot tell the forms apart"
+    fi
+fi
+
+# soak.sh must install its traps through the helper. Read against
+# comment-stripped code like the soak invariants above. This check errs
+# toward failing: a trap line built some other way (a variable, a string
+# eval) fails it rather than slipping past, which is the safe direction
+# for a check whose job is to find one specific call.
+SOAK_TRAP_CODE=$(grep -v '^[[:space:]]*#' soak.sh)
+if printf '%s\n' "${SOAK_TRAP_CODE}" | grep -qE '^[[:space:]]*drill_trap_cleanup[[:space:]]+soak_cleanup[[:space:]]*$' &&
+   ! printf '%s\n' "${SOAK_TRAP_CODE}" | grep -qE '(^|[;&|[:space:]])trap[[:space:]]+[^-[:space:]].*(INT|TERM)'; then
+    ok "soak.sh installs its traps through drill_trap_cleanup and sets no signal trap of its own"
+else
+    bad "soak.sh must call 'drill_trap_cleanup soak_cleanup' and set no INT/TERM trap of its own"
+fi
+
 head_ "Soak verdict (#1199)"
 # The soak records and decides nothing; soak_verdict.py grades A1 off what
 # it recorded. Its self-test reproduces the 2026-09-14 run's hand verdict
