@@ -386,3 +386,71 @@ func TestFacade_CachesSharesTheClient(t *testing.T) {
 		t.Error("Caches opened a second client")
 	}
 }
+
+// TestFacade_InstallingHooksKeepsTheClient: MaybeWireContextCache builds
+// the manager on Caches() and then installs the hooks. Before core-models
+// v0.8.0 (#31) the library took hooks only at construction, so
+// installing them dropped the client and the next call built a second
+// one, leaving the manager's genai.Caches on a client nothing else used.
+// The hooks now go onto the client in place: same client, same cached
+// library model, and a model from before the hooks stamps the cache.
+func TestFacade_InstallingHooksKeepsTheClient(t *testing.T) {
+	t.Parallel()
+	f := newFakeGenerate(t)
+	p := testVertex(t, f)
+	m, err := p.Model(context.Background(), "gemini-3.5-flash")
+	if err != nil {
+		t.Fatalf("Model: %v", err)
+	}
+	generateOnce(t, context.Background(), m)
+	client := p.client
+	lib := p.models["gemini-3.5-flash"]
+	if _, err := p.Caches(context.Background()); err != nil {
+		t.Fatalf("Caches: %v", err)
+	}
+
+	p.SetContextCache("gemini-3.5-flash",
+		func(context.Context, *genai.Content, []*genai.Tool) {},
+		func(context.Context) string { return "projects/proj/locations/us-central1/cachedContents/abc" })
+	p.SetContextCacheInvalidate(func(string, string) {})
+	if p.client != client {
+		t.Fatal("installing context-cache hooks built a second client")
+	}
+	generateOnce(t, context.Background(), m)
+	if got := f.last(t)["cachedContent"]; got != "projects/proj/locations/us-central1/cachedContents/abc" {
+		t.Errorf("request after the hooks carried cachedContent %v, want the hook's name", got)
+	}
+	if p.client != client || p.models["gemini-3.5-flash"] != lib {
+		t.Error("a call after the hooks ran on a rebuilt client or library model")
+	}
+}
+
+// TestFacade_RejectedHooksStillSurfaceOnTheNextCall: hooks with no model
+// to scope them to are a wiring error the library refuses. Setting them
+// on a built client cannot return it (SetContextCache has no error), so
+// the client is dropped and the next call's rebuild reports it — the
+// pre-v0.8.0 behaviour, rather than a silently ignored hook.
+func TestFacade_RejectedHooksStillSurfaceOnTheNextCall(t *testing.T) {
+	t.Parallel()
+	f := newFakeGenerate(t)
+	p := testVertex(t, f)
+	m, err := p.Model(context.Background(), "gemini-3.5-flash")
+	if err != nil {
+		t.Fatalf("Model: %v", err)
+	}
+	p.SetContextCacheInvalidate(func(string, string) {})
+	if p.client != nil {
+		t.Fatal("a hook the library rejected left the client in place")
+	}
+	var callErr error
+	for _, err := range m.GenerateContent(context.Background(), &adkmodel.LLMRequest{
+		Contents: []*genai.Content{genai.NewContentFromText("hi", genai.RoleUser)},
+	}, false) {
+		if err != nil {
+			callErr = err
+		}
+	}
+	if callErr == nil || !strings.Contains(callErr.Error(), "ContextCacheModel") {
+		t.Errorf("next call error = %v, want the library's missing-ContextCacheModel error", callErr)
+	}
+}

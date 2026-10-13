@@ -41,6 +41,8 @@ import (
 	adkmodel "google.golang.org/adk/v2/model"
 	adktool "google.golang.org/adk/v2/tool"
 
+	"github.com/go-steer/core-models/adkv2"
+
 	"github.com/go-steer/core-agent/v3/internal/approvalnotify"
 	"github.com/go-steer/core-agent/v3/internal/version"
 	"github.com/go-steer/core-agent/v3/internal/webui"
@@ -58,7 +60,6 @@ import (
 	"github.com/go-steer/core-agent/v3/pkg/mcp"
 	"github.com/go-steer/core-agent/v3/pkg/models"
 	"github.com/go-steer/core-agent/v3/pkg/models/anthropic"
-	"github.com/go-steer/core-agent/v3/pkg/models/gemini"
 	_ "github.com/go-steer/core-agent/v3/pkg/models/mock"
 	"github.com/go-steer/core-agent/v3/pkg/models/profiles"
 	"github.com/go-steer/core-agent/v3/pkg/modeltier"
@@ -1403,6 +1404,10 @@ func run(prompt, initialPrompt, cfgPath, agentsDirFlag, modelOverride, providerO
 	} else {
 		usage.SetCatalog(catalog)
 	}
+	// A provider profile's declared context window is what its server
+	// serves; compaction sizes against it ahead of the model's
+	// published window (compactionBootLine below reads it too).
+	usage.SetDeclaredContextWindows(cfg.ProfileContextWindows())
 
 	// Resolve the parent model's pricing rate now that the layered
 	// catalog is installed. tracker was hoisted earlier for symmetry
@@ -2164,7 +2169,7 @@ func run(prompt, initialPrompt, cfgPath, agentsDirFlag, modelOverride, providerO
 		// model event that carried the grounding metadata.
 		switch cfg.Model.Provider {
 		case config.ProviderGemini, config.ProviderVertex:
-			handle.Service = gemini.GroundingProjection(handle.Service)
+			handle.Service = adkv2.GroundingProjection(handle.Service)
 		}
 		opts = append(opts, agent.WithEventLog(handle))
 		eventlogHandle = handle

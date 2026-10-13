@@ -361,15 +361,17 @@ WAL mode is enabled by default for SQLite (`PRAGMA journal_mode=WAL`) so concurr
 
 ### Projecting server-side built-in evidence
 
-Wrap the handle's `Service` with `gemini.GroundingProjection(...)` to project Gemini `GoogleSearch` activity (queries + grounded URLs) into the eventlog as queryable `gemini/google_search`-authored rows. Synthetic events inherit the parent event's branch + invocation ID and are deduplicated; their `Content.Role` is empty so ADK's content processor doesn't reinject them as conversation history on subsequent turns.
+Wrap the handle's `Service` with core-models' `adkv2.GroundingProjection(...)` to project Gemini `GoogleSearch` activity (queries + grounded URLs) into the eventlog as queryable `gemini/google_search`-authored rows. Synthetic events inherit the parent event's branch + invocation ID and are deduplicated; their `Content.Role` is empty so ADK's content processor doesn't reinject them as conversation history on subsequent turns.
 
 ```go
-import "github.com/go-steer/core-agent/v3/pkg/models/gemini"
+import "github.com/go-steer/core-models/adkv2"
 
 handle, _ := eventlog.Open(ctx, sqlite.Open("sessions.db"))
-handle.Service = gemini.GroundingProjection(handle.Service)
+handle.Service = adkv2.GroundingProjection(handle.Service)
 a, _ := agent.New(m, agent.WithEventLog(handle))
 ```
+
+`gemini.GroundingProjection` in `pkg/models/gemini` is the same function under its old name, kept as a deprecated wrapper; `gemini.AuthorGoogleSearch` is still the author constant to filter on.
 
 The bundled CLI wires this automatically when `--session-db` is combined with `--provider=gemini` / `vertex`. Library callers using Anthropic or non-Gemini providers don't need to wrap. See [Providers → Surfacing grounded search activity](/concepts/providers/) for the data flow and the runner-side display story.
 

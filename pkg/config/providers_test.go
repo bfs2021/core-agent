@@ -61,6 +61,28 @@ func TestLoad_DeclaredProfileIsSelectable(t *testing.T) {
 	}
 }
 
+// TestProfileContextWindows: a declared context_window reaches the map,
+// a model that declares none is absent (so compaction falls back to its
+// own tables), and the first profile to declare a model wins.
+func TestProfileContextWindows(t *testing.T) {
+	t.Parallel()
+	first := `{"name":"house-vllm","extends":"vllm","base_url":"http://10.0.0.2:8000/v1",
+		"models":[{"id":"google/gemma-4-26B-A4B-it","context_window":65536},{"id":"openai/gpt-oss-20b"}]}`
+	second := `{"name":"other-vllm","extends":"vllm","base_url":"http://10.0.0.3:8000/v1",
+		"models":[{"id":"google/gemma-4-26B-A4B-it","context_window":131072}]}`
+	cfg, _, err := loadBody(t, `{"version":1,"providers":[`+first+`,`+second+`]}`)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := cfg.ProfileContextWindows()
+	if len(got) != 1 || got["google/gemma-4-26B-A4B-it"] != 65536 {
+		t.Errorf("ProfileContextWindows = %v, want only gemma at the first profile's 65536", got)
+	}
+	if w := DefaultConfig().ProfileContextWindows(); w != nil {
+		t.Errorf("no profiles: ProfileContextWindows = %v, want nil", w)
+	}
+}
+
 // Every core-models built-in is selectable with no declaration, and
 // core-agent's own names never resolve to a profile.
 func TestKnownProvider(t *testing.T) {

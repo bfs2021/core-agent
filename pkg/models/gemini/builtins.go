@@ -198,9 +198,9 @@ func WithContextCache(model string, init ContextCacheInitFn, name ContextCacheNa
 // a *genai.Caches client on the same endpoint and credentials
 // (Caches).
 //
-// Safe at any time: it replaces the Provider's shared client, and every
-// model — including one Model() returned earlier — uses the hooks from
-// its next call on.
+// Safe at any time: the hooks go onto the Provider's shared client, and
+// every model — including one Model() returned earlier — uses them from
+// its next call on. No second client is built.
 func (p *Provider) SetContextCache(model string, init ContextCacheInitFn, name ContextCacheNameFn) {
 	p.setHooks(func() {
 		p.cacheModel = model

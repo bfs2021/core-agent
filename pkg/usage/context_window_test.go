@@ -134,3 +134,47 @@ func TestTracker_ContextWindow_TracksLastTurn(t *testing.T) {
 		t.Errorf("ContextWindowUsed() after model switch = %d, want 50000", got)
 	}
 }
+
+// TestDeclaredContextWindowsOutrankTheCatalog: a provider profile's
+// declared window is what its server serves, so it answers ahead of the
+// generated table and the substring fallback, case-insensitively, and a
+// nil install clears it. Not parallel: it swaps a process global, and
+// Go holds the parallel tests until the serial ones are done.
+func TestDeclaredContextWindowsOutrankTheCatalog(t *testing.T) {
+	t.Cleanup(func() { SetDeclaredContextWindows(nil) })
+	const catalogued = "gemini-2.5-flash"
+	published := ContextWindowSizeFor(catalogued)
+	if published == 0 {
+		t.Fatalf("%s is not in the generated table; pick a catalogued id", catalogued)
+	}
+	if got := ContextWindowSizeFor("google/gemma-4-26B-A4B-it"); got != 0 {
+		t.Fatalf("uncatalogued id resolved to %d before any declaration; pick another", got)
+	}
+
+	SetDeclaredContextWindows(map[string]int{
+		"google/gemma-4-26B-A4B-it": 65536,
+		catalogued:                  32768,
+		"ignored-zero":              0,
+	})
+	for _, tc := range []struct {
+		model string
+		want  int
+	}{
+		{"google/gemma-4-26B-A4B-it", 65536},
+		{"GOOGLE/GEMMA-4-26B-A4B-IT", 65536},
+		{catalogued, 32768},
+		{"ignored-zero", 0},
+	} {
+		if got := ContextWindowSizeFor(tc.model); got != tc.want {
+			t.Errorf("declared: ContextWindowSizeFor(%q) = %d, want %d", tc.model, got, tc.want)
+		}
+	}
+
+	SetDeclaredContextWindows(nil)
+	if got := ContextWindowSizeFor(catalogued); got != published {
+		t.Errorf("after clearing: ContextWindowSizeFor(%q) = %d, want the published %d", catalogued, got, published)
+	}
+	if got := ContextWindowSizeFor("google/gemma-4-26B-A4B-it"); got != 0 {
+		t.Errorf("after clearing: the declared-only id still resolves to %d", got)
+	}
+}

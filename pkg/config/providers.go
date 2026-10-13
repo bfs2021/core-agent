@@ -114,6 +114,50 @@ func (c *Config) validateProviders() error {
 	return nil
 }
 
+// ProfileContextWindows collects the input window each declared profile
+// model states (profile.Profile.ContextWindowFor), keyed by model id,
+// for pkg/usage's compaction sizing. It is the window as that server
+// serves it, which for a self-hosted model is often below the model's
+// published one (a vLLM --max-model-len). The first profile to declare
+// a model wins, as with ProfileRates. Nil when none declares a window.
+//
+// Profiles are read with their extends applied, and the selected
+// provider's profile is read even when it is a built-in nobody
+// declared, so a window core-models ships on a built-in model counts
+// too.
+func (c *Config) ProfileContextWindows() map[string]int {
+	var profiles []profile.Profile
+	for _, p := range c.Providers {
+		if x, err := profile.Expand(p); err == nil {
+			p = x
+		}
+		profiles = append(profiles, p)
+	}
+	if sel, ok := c.Profile(c.Model.Provider); ok {
+		if x, err := profile.Expand(sel); err == nil {
+			sel = x
+		}
+		profiles = append(profiles, sel)
+	}
+	var out map[string]int
+	for _, p := range profiles {
+		for _, m := range p.Models {
+			n, ok := p.ContextWindowFor(m.ID)
+			if !ok {
+				continue
+			}
+			if _, dup := out[m.ID]; dup {
+				continue
+			}
+			if out == nil {
+				out = map[string]int{}
+			}
+			out[m.ID] = n
+		}
+	}
+	return out
+}
+
 // ProfileRates collects the per-model rates the declared profiles
 // carry, keyed by model id, for pkg/pricing's lowest-precedence layer:
 // the operator's price for a model no published catalog covers, such
