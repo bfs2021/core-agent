@@ -114,30 +114,47 @@ func (c *Config) validateProviders() error {
 	return nil
 }
 
-// ProfileContextWindows collects the input window each declared profile
-// model states (profile.Profile.ContextWindowFor), keyed by model id,
-// for pkg/usage's compaction sizing. It is the window as that server
-// serves it, which for a self-hosted model is often below the model's
-// published one (a vLLM --max-model-len). The first profile to declare
-// a model wins, as with ProfileRates. Nil when none declares a window.
+// ProfileContextWindows collects the input window each profile model
+// states (profile.Profile.ContextWindowFor), keyed by model id, for
+// pkg/usage's compaction sizing. It is the window as that server serves
+// it, which for a self-hosted model is often below the model's published
+// one (a vLLM --max-model-len). Nil when no routed profile declares one.
 //
-// Profiles are read with their extends applied, and the selected
-// provider's profile is read even when it is a built-in nobody
-// declared, so a window core-models ships on a built-in model counts
-// too.
+// Only profiles this process routes to count: model.provider first,
+// then each subagents[].model.provider in declaration order, and the
+// first to state a window for an id wins. A profile that is merely
+// declared contributes nothing. The map is keyed by bare model id and
+// pkg/usage consults it ahead of the catalog for every provider, so a
+// window from a profile nothing uses — a proxy declaring
+// gemini-2.5-flash at 32K — would otherwise resize native sessions of
+// that model, and a second declaration of the serving model could
+// outrank the server actually serving it.
+//
+// Profiles are read with extends applied, and a selected built-in is
+// read even though nobody declared it. No v0.8.0 built-in states a
+// window; that is so a later one counts without a change here.
 func (c *Config) ProfileContextWindows() map[string]int {
 	var profiles []profile.Profile
-	for _, p := range c.Providers {
+	seen := map[string]bool{}
+	route := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		p, ok := c.Profile(name)
+		if !ok {
+			return
+		}
 		if x, err := profile.Expand(p); err == nil {
 			p = x
 		}
 		profiles = append(profiles, p)
 	}
-	if sel, ok := c.Profile(c.Model.Provider); ok {
-		if x, err := profile.Expand(sel); err == nil {
-			sel = x
+	route(c.Model.Provider)
+	for _, s := range c.Subagents {
+		if s.Model != nil {
+			route(s.Model.Provider)
 		}
-		profiles = append(profiles, sel)
 	}
 	var out map[string]int
 	for _, p := range profiles {

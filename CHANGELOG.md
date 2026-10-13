@@ -18,7 +18,7 @@ The `extras/` adapters (`extras/scion-agent/`, `extras/ax-agent/`) and the `inte
 
 #### Feature
 
-- **A provider profile's declared `context_window` now sizes compaction.** core-models v0.8.0 lets a profile model state the window its server actually serves (`"context_window": 65536` on a `models[]` entry — for vLLM, its `--max-model-len`). Compaction and the boot `compaction: fires at …` line now use that ahead of the built-in table, so a self-hosted model capped below its published window compacts before the server rejects the request, and an uncatalogued profile model no longer falls back to the assumed 128,000 tokens when its profile says otherwise. ([#1320](https://github.com/go-steer/core-agent/pull/1320))
+- **A provider profile's declared `context_window` now sizes compaction.** core-models v0.8.0 lets a profile model state the window its server actually serves (`"context_window": 65536` on a `models[]` entry — for vLLM, its `--max-model-len`). Compaction and the boot `compaction: fires at …` line now use that ahead of the built-in table, so a self-hosted model capped below its published window compacts before the server rejects the request, and an uncatalogued profile model no longer falls back to the assumed 128,000 tokens when its profile says otherwise. Only profiles the process routes to count — `model.provider`, then each `subagents[].model.provider` — so a profile that is declared but unused never resizes another provider's session of the same model id. The remote attach TUI still shows the catalog window for such a model; the daemon does not send its window over attach yet. ([#1320](https://github.com/go-steer/core-agent/pull/1320))
 
 #### Other (Cleanup)
 
