@@ -779,6 +779,17 @@ idle session's events resumes it, and a resume can run auto-continue. Live
 captures and replays can be passed together: every `agent` frame is counted
 once, keyed on its event ID.
 
+`last_touched_at` moves when a client touches a session, not when the daemon
+drives a turn itself (auto-continue, a background subagent's report, a wake).
+On a daemon that already held sessions when the batch began, one of those can
+take a turn inside the window and still list an older `last_touched_at`, so the
+default selection never reads it, and any failure it hit reads as log-only. The
+2026-10-13 soak scored provider retries 4 vs 2 that way, for a run that was
+4 vs 4. When `a2_count` reports log-only failures on a daemon that predates the
+batch, re-run with `--every-session --include-idle` before believing them. It
+replays every session on the hub and keeps the window, which is what drops
+history from outside it.
+
 The tool cannot check that the log and the captures cover the same sessions;
 `--session ID` narrows the log to one session's lines, except retry lines, which
 name no session.

@@ -16,7 +16,7 @@
 # Save a server-side replay of every session on the hub touched in a
 # window, for grading box A2 (#1042) with a2_count.py (#1258).
 #
-#   ./replay_sessions.sh --since 2026-10-06T17:30:00Z [--until <ts>] [--out <dir>]
+#   ./replay_sessions.sh --since 2026-10-06T17:30:00Z [--until <ts>] [--every-session] [--out <dir>]
 #   ./replay_sessions.sh --all [--out <dir>]
 #
 # Why this exists. The drill captures the ONE session it decided was its
@@ -50,6 +50,23 @@
 # outside it on both sides. With --all there is no window to give; the
 # script says so, and a grade from it is a read, not a verdict.
 #
+# last_touched_at is NOT "last activity". The daemon advances it when a
+# client touches the session (creating it, an inject, a read), and not
+# when the daemon drives a turn itself: auto-continue, a background
+# subagent's report, a scheduled wake. On a daemon that already held
+# sessions when the batch began, one of those can take a turn inside the
+# window, hit a failure there, and still list a last_touched_at from
+# before it. The 2026-10-13 soak had two: their transcripts carried two
+# of the four provider retries the log counted, neither was replayed,
+# and a2_count read 4 vs 2, FAIL, for a run that was 4 vs 4. That
+# direction is the safe one (a missed session can only turn a PASS into
+# a FAIL), but it is a false FAIL all the same. --every-session takes
+# every session on the hub, whatever its last_touched_at, and keeps the
+# window: replays hold history from seq 0, and the window a2_count is
+# given is what drops everything outside it, on both sides. Pair it with
+# --include-idle, since a session the daemon drove and then let go is
+# idle by the time the batch is graded.
+#
 # Idle sessions are skipped unless --include-idle. Requesting /events on
 # an idle session lazily resumes it, and a resume can run auto-continue,
 # which starts a model turn — a grading helper must not do that to a
@@ -74,13 +91,16 @@ source "${DRILL_SELF_DIR}/lib.sh"
 
 usage() {
     cat >&2 <<'EOF'
-usage: ./replay_sessions.sh (--since <RFC3339> [--until <RFC3339>] | --all)
+usage: ./replay_sessions.sh (--since <RFC3339> [--until <RFC3339>] [--every-session] | --all)
                             [--out <dir>] [--include-idle]
 
 Saves GET /sessions/<app>/<sid>/events?since=0 for every session on the
 hub whose last_touched_at falls in the window, to <dir>/replay-<sid>.sse,
-with a sessions.tsv manifest and the window in window.env. Grade with
-the line it prints, which passes the same window to a2_count:
+with a sessions.tsv manifest and the window in window.env.
+--every-session replays every session whatever its last_touched_at,
+which a turn the daemon drove itself does not advance, and still
+records the window. Grade with the line it prints, which passes the
+same window to a2_count:
 
   ./a2_count.py --log daemon.log --events <dir>/replay-*.sse --since <start> --until <end>
 
@@ -92,12 +112,13 @@ EOF
     exit "${1:-1}"
 }
 
-SINCE="" UNTIL="" ALL=0 OUT="" INCLUDE_IDLE=0
+SINCE="" UNTIL="" ALL=0 EVERY=0 OUT="" INCLUDE_IDLE=0
 while (( $# )); do
     case "$1" in
         --since)        SINCE="${2:?--since needs a timestamp}"; shift ;;
         --until)        UNTIL="${2:?--until needs a timestamp}"; shift ;;
         --all)          ALL=1 ;;
+        --every-session) EVERY=1 ;;
         --out)          OUT="${2:?--out needs a directory}"; shift ;;
         --include-idle) INCLUDE_IDLE=1 ;;
         -h|--help)      usage 0 ;;
@@ -105,6 +126,12 @@ while (( $# )); do
     esac
     shift
 done
+if [[ "${EVERY}" == "1" && -z "${SINCE}" ]]; then
+    # Without a window the grade is a read, not a verdict; --all is
+    # already the windowless form.
+    printf -- '--every-session needs --since: it widens which sessions are read, and the window is what keeps the grade honest\n' >&2
+    usage 1
+fi
 if [[ "${ALL}" == "1" && -n "${SINCE}${UNTIL}" ]] || [[ "${ALL}" == "0" && -z "${SINCE}" ]]; then
     printf 'give exactly one of --since <ts> or --all\n' >&2
     usage 1
@@ -126,7 +153,7 @@ DRILL_RUN_DIR="${OUT}"
 # digits because datetime.fromisoformat before Python 3.11 takes only
 # three or six.
 replay_select() {
-    python3 - "$1" "${SINCE}" "${UNTIL}" "${INCLUDE_IDLE}" "${DRILL_APP}" <<'PY'
+    python3 - "$1" "${SINCE}" "${UNTIL}" "${INCLUDE_IDLE}" "${DRILL_APP}" "${EVERY}" <<'PY'
 import json, re, sys
 from datetime import datetime, timezone
 
@@ -140,13 +167,19 @@ def parse(ts):
 
 path, since, until, include_idle = sys.argv[1], parse(sys.argv[2]), parse(sys.argv[3]), sys.argv[4] == "1"
 default_app = sys.argv[5]
+every = sys.argv[6] == "1"
 for s in json.load(open(path)).get("sessions") or []:
     sid, touched, status = s.get("sessionID", ""), s.get("last_touched_at", ""), s.get("status", "")
     app = s.get("app") or default_app
     if not sid:
         continue
     t = parse(touched) if touched else None
-    if since and (t is None or t < since):
+    if every:
+        # last_touched_at does not see a daemon-driven turn; the window
+        # given to a2_count bounds the grade instead (see the header).
+        verdict = "skip: idle (a read would resume it; --include-idle to read anyway)" \
+            if status == "idle" and not include_idle else "take"
+    elif since and (t is None or t < since):
         verdict = "skip: not touched since --since" if t else "skip: no last_touched_at"
     elif until and t is not None and t > until:
         verdict = "skip: touched after --until"

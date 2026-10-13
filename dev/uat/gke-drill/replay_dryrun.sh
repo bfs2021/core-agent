@@ -76,19 +76,22 @@ export REGION=us-central1 MODEL_FLAVOR=gemini DEMO_NS=drill-demo TARGET_NS=drill
 export WORKLOAD=emailservice DRILL_PORT=7861 DRILL_REPLAY_SECS=1
 
 # One session's replay: a per-turn cut and the turn error it caused, as
-# the durable rows a #1258 daemon writes, plus the incident prompt.
+# the durable rows a #1258 daemon writes, plus the incident prompt, all
+# stamped with the time the turn ran (an a2_count window reads it).
 replay_fixture() {
-    local sid="$1"
-    python3 - "${sid}" <<'PY'
+    local sid="$1" at="$2"
+    python3 - "${sid}" "${at}" <<'PY'
 import json, sys
-sid = sys.argv[1]
+sid, at = sys.argv[1], sys.argv[2]
 frames = [
-    {"seq": 1, "event": {"ID": f"{sid}-u", "Author": "user",
+    {"seq": 1, "event": {"ID": f"{sid}-u", "Author": "user", "Timestamp": at,
                          "Content": {"role": "user", "parts": [{"text": "[Inbox] emailservice ImagePullBackOff"}]}}},
     {"seq": 2, "event": {"ID": f"{sid}-trip", "Author": "agent/guardrail-turn-trip", "InvocationID": "guardrail-turn-trip",
+                         "Timestamp": at,
                          "CustomMetadata": {"source": "agent", "guardrail": "cost_ceiling",
                                             "reason": "per-turn cost ceiling exceeded", "halted_turn": True}}},
     {"seq": 3, "event": {"ID": f"{sid}-err", "Author": "agent/turn-error", "InvocationID": "turn-error",
+                         "Timestamp": at,
                          "CustomMetadata": {"source": "agent", "kind": "canceled", "code": "CANCELED",
                                             "message": "turn canceled", "retryable": False, "cut_by": "cost_ceiling"}}},
 ]
@@ -116,10 +119,15 @@ run_case() {
         {sessionID: "sess-idle",   last_touched_at: "2026-10-06T17:40:00Z",           status: "idle"},
         {sessionID: "sess-late",   last_touched_at: "2026-10-06T23:00:00Z",           status: "active"}
     ]}' > "${DRILL_FAKE_DIR}/sessions-after.json"
-    local sid
-    for sid in sess-old sess-inc-1 sess-inc-2 sess-idle sess-late; do
-        replay_fixture "${sid}" > "${DRILL_FAKE_DIR}/events-${sid}.sse"
-    done
+    # sess-old's turn runs INSIDE the 17:30–18:00 window while its
+    # last_touched_at says 16:00: the shape a daemon-driven turn leaves
+    # (auto-continue, a background report, a wake), which does not
+    # advance last_touched_at. sess-late's turn is outside the window.
+    replay_fixture sess-old   2026-10-06T17:37:00Z > "${DRILL_FAKE_DIR}/events-sess-old.sse"
+    replay_fixture sess-inc-1 2026-10-06T17:36:30Z > "${DRILL_FAKE_DIR}/events-sess-inc-1.sse"
+    replay_fixture sess-inc-2 2026-10-06T17:37:02Z > "${DRILL_FAKE_DIR}/events-sess-inc-2.sse"
+    replay_fixture sess-idle  2026-10-06T17:40:00Z > "${DRILL_FAKE_DIR}/events-sess-idle.sse"
+    replay_fixture sess-late  2026-10-06T23:00:00Z > "${DRILL_FAKE_DIR}/events-sess-late.sse"
     OUT_DIR="${dir}/out"
     LOG="${dir}/replay.out"
     set +e
@@ -202,6 +210,55 @@ grep_ "…with the usage" "${LOG}" 'give exactly one of --since'
 ungrep "…and no tunnel was opened" "${CALLS}" 'port-forward'
 run_case both --all --since 2026-10-06T17:30:00Z
 eq "--all with --since: exit 1" "${RC}" "1"
+run_case everynowindow --every-session
+eq "--every-session alone: exit 1" "${RC}" "1"
+grep_ "…saying it needs --since" "${LOG}" 'every-session needs --since'
+ungrep "…and no tunnel was opened" "${CALLS}" 'port-forward'
+run_case everyall --every-session --all
+eq "--every-session with --all: exit 1" "${RC}" "1"
+
+# The 2026-10-13 soak. A session the daemon drove itself during the
+# window (sess-old: rows at 17:37, last_touched_at 16:00) hit a failure
+# that the log counted. (sess-idle took one too; plain --since skips it
+# for being idle, which --include-idle answers.) Selecting by last_touched_at never read it, so
+# A2 failed a run in which every failure WAS on a transcript.
+A2OLD="${WORKDIR}/daemon-old.log"
+{
+    for s in sess-inc-1 sess-inc-2 sess-old sess-idle; do
+        printf '2026-10-06T17:37:30Z agent: [session %s] cost_ceiling guardrail cut the turn in flight — the cancellation error that follows is this cut, not a provider failure: per-turn\n' "${s}"
+        printf '2026-10-06T17:37:31Z core-agent: session %s turn: context canceled\n' "${s}"
+    done
+} > "${A2OLD}"
+
+head_ "8. a daemon-driven turn leaves last_touched_at behind: --since misses it"
+run_case touchedonly --since 2026-10-06T17:30:00Z --until 2026-10-06T18:00:00Z
+eq "exit 0" "${RC}" "0"
+absent "sess-old is not read: its last_touched_at is before the window" "${OUT_DIR}/replay-sess-old.sse"
+set +e
+python3 a2_count.py --log "${A2OLD}" --events "${OUT_DIR}"/replay-*.sse \
+    --since 2026-10-06T17:30:00Z --until 2026-10-06T18:00:00Z > "${WORKDIR}/a2-touched.out" 2>&1
+A2TOUCHED=$?
+set -e
+grep_ "…so the trips they took read as log-only: 4 vs 2" "${WORKDIR}/a2-touched.out" '\| guardrail trip \| 4 \| 2 \| 2 \| \*\*FAIL\*\*'
+eq "…and A2 fails a run with nothing log-only" "${A2TOUCHED}" "1"
+
+head_ "9. --every-session reads it, and the window still bounds the grade"
+run_case every --since 2026-10-06T17:30:00Z --until 2026-10-06T18:00:00Z --every-session --include-idle
+eq "exit 0" "${RC}" "0"
+have "sess-old is replayed" "${OUT_DIR}/replay-sess-old.sse"
+have "so is a session touched after --until (it can still have turned inside the window)" "${OUT_DIR}/replay-sess-late.sse"
+grep_ "the window is still recorded" "${OUT_DIR}/window.env" '^WINDOW_START=2026-10-06T17:30:00Z$'
+set +e
+python3 a2_count.py --log "${A2OLD}" --events "${OUT_DIR}"/replay-*.sse \
+    --since 2026-10-06T17:30:00Z --until 2026-10-06T18:00:00Z > "${WORKDIR}/a2-every.out" 2>&1
+A2EVERY=$?
+set -e
+# sess-late's rows (23:00) are outside the window and must be dropped:
+# kept, they would be a fifth trip with no log line, TRANSCRIPT-ONLY.
+grep_ "trip: the log's 4 are the transcripts' 4" "${WORKDIR}/a2-every.out" '\| guardrail trip \| 4 \| 4 \| 0 \| \*\*PASS\*\*'
+grep_ "…and turn error 4 vs 4" "${WORKDIR}/a2-every.out" '\| turn error \| 4 \| 4 \| 0 \| \*\*PASS\*\*'
+grep_ "the window dropped sess-late's out-of-window rows" "${WORKDIR}/a2-every.out" 'window dropped [1-9][0-9]* transcript event'
+ungrep "…no class fails" "${WORKDIR}/a2-every.out" '\*\*FAIL\*\*'
 
 printf '\n%d passed, %d failed\n' "${PASS}" "${FAIL}"
 (( FAIL == 0 ))
