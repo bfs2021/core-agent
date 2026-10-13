@@ -26,6 +26,27 @@
 
 set -euo pipefail
 
+# drill_trap_cleanup FN: run FN once when the script ends, however it ends.
+#
+# `trap FN EXIT INT TERM` looks equivalent and is not. A trap on a signal
+# runs its handler and then RESUMES the script, so unless FN exits, a
+# SIGTERM runs the cleanup and the main loop carries on. A cleanup that
+# opens with `trap - EXIT INT TERM`, as soak.sh's does, also disarms
+# itself on the way, so nothing stops the loop after that. On 2026-10-13
+# a soak "stopped" with SIGTERM kept breaking emailservice every half
+# hour for four more hours, interleaved with the soak that replaced it.
+# Their one-revision `rollout undo` restores undid each other until the
+# Deployment's spec sat on the bad image AND the 8Mi limit.
+#
+# Here the signals only exit. EXIT runs FN exactly once, with the
+# signal's status (130 or 143) in $?. A signal that lands during a
+# foreground `sleep` is still handled when the sleep returns, as before.
+drill_trap_cleanup() {
+    trap "$1" EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
 DRILL_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 REPO_ROOT=$( cd -- "${DRILL_DIR}/../../.." &> /dev/null && pwd )
 DRILL_RECIPE_DIR="${DRILL_RECIPE_DIR:-${REPO_ROOT}/examples/gke-platform-agent}"

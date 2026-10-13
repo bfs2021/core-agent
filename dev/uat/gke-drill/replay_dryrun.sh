@@ -59,7 +59,12 @@ cleanup() {
     fi
     return 0
 }
-trap cleanup EXIT INT TERM
+# Signals only exit; EXIT runs cleanup once. `trap cleanup EXIT INT TERM`
+# would run cleanup on Ctrl-C and then carry on with the next case
+# (see drill_trap_cleanup in lib.sh, which this script does not source).
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/gke-drill-replay-dryrun.XXXXXX")"
 
 export PATH="${FAKEBIN}:${PATH}"
