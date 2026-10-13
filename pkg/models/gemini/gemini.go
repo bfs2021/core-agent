@@ -78,11 +78,11 @@ type Provider struct {
 	cacheInvalidate ContextCacheInvalidateFn
 
 	// client is the one core-models client every model shares, built on
-	// first use. The library takes context-cache hooks per Client, so
-	// installing hooks (SetContextCache, SetContextCacheInvalidate)
-	// drops it and the next call rebuilds it with them; models resolve
-	// the client per call (lateModel), so one returned before the hooks
-	// were installed still gets them. mu guards the hooks and client.
+	// first use. Installing hooks (SetContextCache,
+	// SetContextCacheInvalidate) sets them on this client, and the
+	// library's models read them per call, so a model returned before
+	// the hooks were installed still gets them. mu guards the hooks and
+	// client.
 	mu     sync.Mutex
 	client *cmgemini.Client
 	// models caches the library model per id for the current client.
@@ -150,14 +150,32 @@ func geminiRetry() *retry.Policy {
 	return &pol
 }
 
-// setHooks applies a hook change and drops the client, so the next
-// call rebuilds it with the hooks.
+// setHooks applies a hook change to the client already built, which
+// every model reads per call, so nothing is rebuilt: Caches() and the
+// running models stay on the one client. A combination the library
+// rejects (hooks with no model to scope them to) drops the client
+// instead, so the next call's rebuild reports it, as before #31.
 func (p *Provider) setHooks(apply func()) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	apply()
-	p.client = nil
-	p.models = nil
+	if p.client == nil {
+		return
+	}
+	if err := p.client.SetContextCache(p.contextCache()); err != nil {
+		p.client = nil
+		p.models = nil
+	}
+}
+
+// contextCache is the hooks in force. Call with p.mu held.
+func (p *Provider) contextCache() cmgemini.ContextCache {
+	return cmgemini.ContextCache{
+		Model:      p.cacheModel,
+		Init:       p.cacheInit,
+		Name:       p.cacheName,
+		Invalidate: p.cacheInvalidate,
+	}
 }
 
 // libModel returns the library model for id on the current client,
@@ -202,8 +220,8 @@ func (p *Provider) libClient(ctx context.Context) (*cmgemini.Client, error) {
 // Caches returns the genai caches service on this Provider's endpoint
 // and credentials, for building a vertexcache.Manager (see
 // pkg/compose.MaybeWireContextCache) without a second copy of the
-// backend, project and auth detection. It is the shared client's; the
-// service stays usable after installing hooks replaces that client.
+// backend, project and auth detection. It is the shared client's, and
+// installing hooks afterwards keeps that client.
 func (p *Provider) Caches(ctx context.Context) (*genai.Caches, error) {
 	c, err := p.libClient(ctx)
 	if err != nil {

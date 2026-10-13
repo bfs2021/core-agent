@@ -61,6 +61,66 @@ func TestLoad_DeclaredProfileIsSelectable(t *testing.T) {
 	}
 }
 
+// TestProfileContextWindows: windows come only from profiles the process
+// routes to — model.provider first, then subagents[].model.provider —
+// and never from a profile that is merely declared. Ordering by route,
+// not by declaration, is the point: big-vllm declares gemma first at
+// 131072, but small-vllm is the server actually serving it at 65536, and
+// sizing compaction to the larger window would overrun that server.
+func TestProfileContextWindows(t *testing.T) {
+	t.Parallel()
+	big := `{"name":"big-vllm","extends":"vllm","base_url":"http://10.0.0.2:8000/v1",
+		"models":[{"id":"google/gemma-4-26B-A4B-it","context_window":131072},{"id":"openai/gpt-oss-20b","context_window":131072}]}`
+	small := `{"name":"small-vllm","extends":"vllm","base_url":"http://10.0.0.3:8000/v1",
+		"models":[{"id":"google/gemma-4-26B-A4B-it","context_window":65536},{"id":"qwen/qwen3-8b"}]}`
+	proxy := `{"name":"litellm-proxy","extends":"openai-compatible","base_url":"http://10.0.0.4:4000/v1",
+		"models":[{"id":"gemini-2.5-flash","context_window":32768}]}`
+	providers := `"providers":[` + big + `,` + small + `,` + proxy + `]`
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want map[string]int
+	}{
+		{
+			name: "the selected profile outranks an earlier declaration of the same model",
+			body: `{"version":1,"model":{"provider":"small-vllm","name":"google/gemma-4-26B-A4B-it"},` + providers + `}`,
+			want: map[string]int{"google/gemma-4-26B-A4B-it": 65536},
+		},
+		{
+			name: "a subagent's profile counts, behind the selected one",
+			body: `{"version":1,"model":{"provider":"small-vllm","name":"google/gemma-4-26B-A4B-it"},` +
+				`"subagents":[{"name":"wide","instructions":"x","model":{"provider":"big-vllm","name":"openai/gpt-oss-20b"}}],` + providers + `}`,
+			want: map[string]int{"google/gemma-4-26B-A4B-it": 65536, "openai/gpt-oss-20b": 131072},
+		},
+		{
+			name: "declared-but-unused profiles contribute nothing",
+			body: `{"version":1,"model":{"provider":"vertex","name":"gemini-2.5-flash"},` + providers + `}`,
+			want: nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, _, err := loadBody(t, tc.body)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			got := cfg.ProfileContextWindows()
+			if len(got) != len(tc.want) {
+				t.Fatalf("ProfileContextWindows = %v, want %v", got, tc.want)
+			}
+			for id, n := range tc.want {
+				if got[id] != n {
+					t.Errorf("ProfileContextWindows[%q] = %d, want %d (all: %v)", id, got[id], n, got)
+				}
+			}
+		})
+	}
+	if w := DefaultConfig().ProfileContextWindows(); w != nil {
+		t.Errorf("no profiles: ProfileContextWindows = %v, want nil", w)
+	}
+}
+
 // Every core-models built-in is selectable with no declaration, and
 // core-agent's own names never resolve to a profile.
 func TestKnownProvider(t *testing.T) {

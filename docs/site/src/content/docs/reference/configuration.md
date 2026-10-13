@@ -266,6 +266,7 @@ Provider profiles: ways to reach models beyond the built-in backends — an Open
       "models": [
         {
           "id": "google/gemma-4-26B-A4B-it",
+          "context_window": 65536,
           "extra_body": { "chat_template_kwargs": { "enable_thinking": true } },
           "rates": { "input_per_mtok": 0.10, "output_per_mtok": 0.40 }
         }
@@ -280,6 +281,7 @@ Provider profiles: ways to reach models beyond the built-in backends — an Open
 |---|---|
 | `name` | What `model.provider` / `--provider` names. May not be one of core-agent's own six provider names, and may appear once. |
 | `extends` | A core-models built-in to start from. Every field set here overrides it. |
+| `models[].context_window` | The input window this server serves for the model, in tokens — for vLLM, its `--max-model-len`, which can be well below the model's published window. Compaction sizes its threshold against it ahead of every other source, when the profile is the one `model.provider` or a subagent's `model.provider` selects (a declared but unused profile's windows are ignored); without it, a model the built-in table doesn't know is assumed to hold 128,000 tokens (see [Context management](/concepts/context-management/)). |
 | `models[].rates` | Your price for a model no catalog covers (USD per 1M tokens). The lowest-precedence [pricing](#model) layer: `model.pricing`, pricing files and the built-in table all outrank it. |
 | `tiers` | The model per tier. `mid` is what runs when you name no model; `small` is the default `--agentic-small-model`. |
 

@@ -619,8 +619,12 @@ func costFromRates(inTok, outTok int, inRate, outRate float64) float64 {
 // unknown or unrecognized — coretui then renders "Context: (unknown)".
 //
 // Same lookup table the embedded TUI's coreUsageBridge uses (both
-// paths flow through pkg/usage), so /stats surfaces identical values
-// whether the operator is in the in-process TUI or attached remotely.
+// paths flow through pkg/usage), with one gap: a provider profile's
+// declared context_window (usage.SetDeclaredContextWindows) is
+// installed in the daemon process only. This client has no config and
+// the attach protocol carries no window, so for a profile model with a
+// declared window the remote figure is the catalog's (or 0) while the
+// in-process TUI and the daemon's compaction use the declared one.
 func (a *Adapter) ContextWindowSize() int {
 	_, _, _ = a.snapshot() // refresh cache; populates lastTurnModel under a.usage.mu
 	a.usage.mu.Lock()

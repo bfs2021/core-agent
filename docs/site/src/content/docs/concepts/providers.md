@@ -169,8 +169,9 @@ ORDER BY seq;
 The `cmd/core-agent` CLI wires the projection automatically when `--session-db` is used with `--provider=gemini` / `vertex`. Library callers opt in explicitly:
 
 ```go
+// import "github.com/go-steer/core-models/adkv2"
 handle, _ := eventlog.Open(ctx, sqlite.Open("sessions.db"))
-handle.Service = gemini.GroundingProjection(handle.Service)
+handle.Service = adkv2.GroundingProjection(handle.Service)
 a, _ := agent.New(m, agent.WithEventLog(handle))
 ```
 
