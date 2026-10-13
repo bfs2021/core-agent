@@ -203,7 +203,7 @@ var GatedFeatures = []GatedFeature{
 	},
 	{
 		Path: "subagents[].scheduler",
-		Min:  "2.10.0-dev.2",
+		Min:  "3.0.0-dev.1",
 		Why: "a declared standing worker that sleeps between turns on schedule_next_turn (#1283). " +
 			"An older daemon drops it, so the subagent spawns as a bounded delegation that " +
 			"finishes after its first turn, and a watcher the content relies on never watches",
@@ -255,7 +255,7 @@ var GatedFeatures = []GatedFeature{
 	},
 	{
 		Path: "permissions.approval_notify_after",
-		Min:  "2.10.0-dev.2",
+		Min:  "3.0.0-dev.1",
 		Why: "also announces a prompt that reached an attached client and then went unanswered (#1167). " +
 			"An older daemon drops it, so a TUI left attached while its operator is away absorbs " +
 			"every prompt and the approval channel hears about none of them",
@@ -280,7 +280,7 @@ var GatedFeatures = []GatedFeature{
 	},
 	{
 		Path: "safety.parallel_subagent_writes",
-		Min:  "2.10.0-dev.2",
+		Min:  "3.0.0-dev.1",
 		Why: "whether two write-capable background subagents may share the working directory (#653). " +
 			"The silent reversal runs BOTH ways here: a recipe that set `refuse` gets concurrent " +
 			"writers on an older daemon, and a recipe that deliberately set `allow` — because its " +
@@ -289,7 +289,7 @@ var GatedFeatures = []GatedFeature{
 	},
 	{
 		Path: "attach.token_file",
-		Min:  "2.10.0-dev.2",
+		Min:  "3.0.0-dev.1",
 		Why: "the file the attach bearer token is read from (#1201). An older daemon drops it and " +
 			"runs the listener with no token at all: a loopback one starts with only a log warning, " +
 			"and the agent's own bash can then answer its permission prompts over it",
