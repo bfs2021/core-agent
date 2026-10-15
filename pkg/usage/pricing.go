@@ -63,6 +63,13 @@ type Pricing struct {
 	// token at it, output included — see pricing.Rates.At. Nil for a
 	// model with one price at every size.
 	LongContext *pricing.LongContext
+	// Backend is the backend the rate was looked up for, as BackendFor
+	// or PriceOn's caller named it: "" when none was known, which
+	// prices from the bare rows. Tracker copies it onto each Turn, so a
+	// later re-pricing of the turn (the /usage savings reference) asks
+	// the same backend the ledger did, even for a subagent whose
+	// provider isn't its parent's.
+	Backend string
 }
 
 // IsZero reports whether the rates carry no useful pricing.
@@ -156,14 +163,14 @@ func PriceForWithSource(modelID string, cfg *config.Config) (Pricing, string) {
 	backend := BackendFor(cfg)
 	if c := globalCatalog.Load(); c != nil {
 		r, src, found := c.LookupForWithSource(backend, modelID)
-		return ratesToPricing(r, found), src
+		return ratesToPricing(r, found, backend), src
 	}
 	c, _ := pricing.NewCatalog(pricing.Options{
 		CfgOverride: cfgToOverride(cfg),
 		Declared:    DeclaredRates(cfg),
 	})
 	r, src, found := c.LookupForWithSource(backend, modelID)
-	return ratesToPricing(r, found), src
+	return ratesToPricing(r, found, backend), src
 }
 
 // PriceFor returns the Pricing for modelID as billed by cfg's backend
@@ -187,7 +194,7 @@ func PriceFor(modelID string, cfg *config.Config) Pricing {
 	backend := BackendFor(cfg)
 	if c := globalCatalog.Load(); c != nil {
 		r, found := c.LookupFor(backend, modelID)
-		return ratesToPricing(r, found)
+		return ratesToPricing(r, found, backend)
 	}
 	// Catalog not installed (test / library). Build a one-shot
 	// catalog from cfg + builtin so the answer is consistent with
@@ -197,7 +204,28 @@ func PriceFor(modelID string, cfg *config.Config) Pricing {
 		Declared:    DeclaredRates(cfg),
 	})
 	r, found := c.LookupFor(backend, modelID)
-	return ratesToPricing(r, found)
+	return ratesToPricing(r, found, backend)
+}
+
+// PriceOn returns the Pricing for modelID as billed by backend, for a
+// cost site that knows which provider served the call but has no cfg
+// naming it: a subagent declared on a provider other than its
+// parent's, whose spend PriceFor(model, nil) would otherwise price at
+// the process backend (SetBackend). An empty backend is exactly
+// PriceFor(modelID, nil).
+//
+// With no catalog installed (tests, library use) there are no
+// declared rates to consult, so it prices from the builtin table.
+func PriceOn(backend, modelID string) Pricing {
+	if backend == "" {
+		return PriceFor(modelID, nil)
+	}
+	c := globalCatalog.Load()
+	if c == nil {
+		c, _ = pricing.NewCatalog(pricing.Options{})
+	}
+	r, found := c.LookupFor(backend, modelID)
+	return ratesToPricing(r, found, backend)
 }
 
 // PriceForRefreshed re-resolves modelID against the process-wide
@@ -242,7 +270,7 @@ func PriceForRefreshed(modelID string, fallback Pricing) Pricing {
 // lockstep as new rate fields land. found is the catalog lookup's
 // found flag; !found marks the result Unpriced so downstream cost
 // aggregation can tell "rate unknown" apart from "genuinely free".
-func ratesToPricing(r pricing.Rates, found bool) Pricing {
+func ratesToPricing(r pricing.Rates, found bool, backend string) Pricing {
 	return Pricing{
 		InputPerMTok:                r.InputPerMTok,
 		CachedInputPerMTok:          r.CachedInputPerMTok,
@@ -252,6 +280,7 @@ func ratesToPricing(r pricing.Rates, found bool) Pricing {
 		UpdatedAt:                   r.UpdatedAt,
 		Unpriced:                    !found,
 		LongContext:                 r.LongContext,
+		Backend:                     backend,
 	}
 }
 

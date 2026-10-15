@@ -206,3 +206,41 @@ func introductoryBackends(model string) []string {
 	}
 	return nil
 }
+
+// PriceOn names the backend outright, for a cost site that knows which
+// provider served the call but has no cfg: a subagent on a provider
+// other than its parent's. It beats the installed process backend, and
+// an empty backend is PriceFor(model, nil).
+func TestPriceOnNamesTheBackend(t *testing.T) {
+	isolatePricing(t)
+	SetBackend("gemini") // the parent's
+	if p := PriceOn("openai", "gpt-5-mini"); p.Unpriced || p.IsZero() || p.Backend != "openai" {
+		t.Errorf(`PriceOn("openai", gpt-5-mini) under a gemini process = %+v, want priced on openai`, p)
+	}
+	if p := PriceOn("", "gpt-5-mini"); !p.Unpriced || p.Backend != "gemini" {
+		t.Errorf(`PriceOn("", gpt-5-mini) = %+v, want PriceFor(nil)'s answer: unpriced, on the process backend`, p)
+	}
+	// Claude Sonnet 4.5's long-context rate exists on Vertex AI only.
+	if p := PriceOn("anthropic-vertex", "claude-sonnet-4-5"); p.LongContext == nil {
+		t.Errorf("anthropic-vertex claude-sonnet-4-5: no long-context rate: %+v", p)
+	}
+	if p := PriceOn("anthropic", "claude-sonnet-4-5"); p.LongContext != nil {
+		t.Errorf("anthropic claude-sonnet-4-5: long-context rate %+v, want none", p.LongContext)
+	}
+}
+
+// The tracker keeps the backend each turn was priced on, so a later
+// re-pricing (the /usage savings reference) asks the same backend.
+func TestTrackerRecordsTheBackend(t *testing.T) {
+	isolatePricing(t)
+	tr := NewTracker()
+	tr.AppendUsage("gpt-5-mini", TurnUsage{InputTokens: 1000, OutputTokens: 100}, PriceOn("openai", "gpt-5-mini"))
+	tr.AppendSideUsage("gemini-3.6-flash", TurnUsage{InputTokens: 10}, PriceOn("", "gemini-3.6-flash"))
+	turns := tr.All()
+	if len(turns) != 2 || turns[0].Backend != "openai" || turns[1].Backend != "" {
+		t.Fatalf("turn backends = %+v, want openai then \"\"", turns)
+	}
+	if turns[0].Unpriced || turns[0].CostUSD <= 0 {
+		t.Errorf("openai turn: unpriced=%v cost=%v, want priced", turns[0].Unpriced, turns[0].CostUSD)
+	}
+}
