@@ -119,6 +119,9 @@ type Manager struct {
 	// smallModelID backs the "small" model override; empty means the
 	// small tier isn't configured and "small" spawns are rejected.
 	smallModelID string
+	// spawnPricing vets the model a spawn is about to run on against the
+	// host's cost ceilings (WithSpawnPricingCheck); nil checks nothing.
+	spawnPricing func(SpawnPricing) error
 	// syncWaitTimeout bounds how long a synchronous spawn (spawn_agent
 	// {wait: true}, #626/D5) may hold the parent turn open before the tool
 	// returns a partial/timeout result. Distinct from — and typically
@@ -511,6 +514,12 @@ type Spec struct {
 	// say WHICH configured subagent is running — the self-spawn guard
 	// matches on it (#732).
 	Ref string
+	// curatedMaxCost is set by resolvePredefinedSpec when Budgets.MaxCost
+	// descends from the operator-curated spec's own budget (tightening
+	// can lower it, never raise it), so the spawn pricing check treats it
+	// as explicit (SpawnPricing.MaxCostExplicit), as it does a declarative
+	// template's. Unexported: a library caller's own Spec cannot claim it.
+	curatedMaxCost bool
 }
 
 // Mode distinguishes the two things "background subagent" has always
@@ -560,6 +569,7 @@ type bgMgrConfig struct {
 	templates        []SubagentTemplate
 	allowAdhoc       bool
 	smallModelID     string
+	spawnPricing     func(SpawnPricing) error
 	syncWaitTimeout  time.Duration
 	parallelWrites   string
 }
@@ -671,6 +681,41 @@ func WithSmallModelID(id string) ManagerOption {
 	return func(c *bgMgrConfig) { c.smallModelID = id }
 }
 
+// WithSpawnPricingCheck vets the model each spawn is about to run on,
+// with the backend that will bill it, before anything is reserved or
+// built. A non-nil error refuses the spawn and is returned to the caller
+// as-is (the parent's model sees it as the tool result).
+//
+// It is the runtime door of the host's unpriced-model policy: an
+// ad-hoc spawn may name any model, and "small" downshifts to the small
+// tier, so a model the host vetted at startup is not the only one a
+// spawn can reach. The host owns the policy because only it knows where
+// its ceilings came from (operator-set, or an unattended default that
+// only warns); the manager just asks.
+func WithSpawnPricingCheck(check func(SpawnPricing) error) ManagerOption {
+	return func(c *bgMgrConfig) { c.spawnPricing = check }
+}
+
+// SpawnPricing is the spawn WithSpawnPricingCheck is asked about: the
+// model it will run on, and the dollar budget it will run under. A
+// budget on a model nobody prices can never hold, since the subagent's
+// spend is counted at $0.
+type SpawnPricing struct {
+	ModelID string
+	// Backend names the backend that bills ModelID ("" = the process
+	// backend).
+	Backend string
+	// MaxCost is the spawn's effective budgets.max_cost_usd, defaults
+	// merged in; 0 for none.
+	MaxCost float64
+	// MaxCostExplicit reports that an operator wrote MaxCost: an attach
+	// caller's max_cost_usd (SpawnSubagent), a declarative subagent's
+	// configured budget, or a predefined spec's own (WithPredefinedSpecs).
+	// A manager default or a budget the parent's model chose in a
+	// spawn_agent call is not.
+	MaxCostExplicit bool
+}
+
 // WithSyncWaitTimeout bounds how long a synchronous spawn (spawn_agent
 // {wait: true}, #626) holds the parent turn open before returning a
 // partial/timeout result. The subagent keeps running in the background
@@ -737,6 +782,7 @@ func NewManager(opts ...ManagerOption) (*Manager, error) {
 		templates:        make(map[string]SubagentTemplate),
 		allowAdhoc:       cfg.allowAdhoc,
 		smallModelID:     cfg.smallModelID,
+		spawnPricing:     cfg.spawnPricing,
 		syncWaitTimeout:  cfg.syncWaitTimeout,
 		instanceSeq:      make(map[string]int),
 		agents:           make(map[string]*Handle),
@@ -1302,8 +1348,11 @@ func (m *Manager) StopSubagent(name string) (attach.StopAgentOutcome, error) {
 // SpawnSubagent implements agent.SubagentManager. Translates an attach
 // spec into a background Spec and delegates to Spawn; backs
 // attachadapter.AttachSpawnSubagent.
+//
+// A max_cost_usd here is the attach caller's own, so the pricing check
+// is told the budget is explicit (SpawnPricing.MaxCostExplicit).
 func (m *Manager) SpawnSubagent(ctx context.Context, spec attach.SubagentSpec) (attach.SubagentSpawnResponse, error) {
-	handle, err := m.Spawn(ctx, "" /* parentBranch */, Spec{
+	handle, err := m.spawn(ctx, "" /* parentBranch */, spec.Budgets.MaxCostUSD > 0, Spec{
 		Name:         spec.Name,
 		SystemPrompt: spec.SystemPrompt,
 		Goal:         spec.Goal,

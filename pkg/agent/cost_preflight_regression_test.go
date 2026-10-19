@@ -1,0 +1,288 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package agent
+
+import (
+	"context"
+	"errors"
+	"iter"
+	"strings"
+	"testing"
+
+	adkmodel "google.golang.org/adk/v2/model"
+	"google.golang.org/genai"
+
+	"github.com/go-steer/core-agent/v3/pkg/models"
+	"github.com/go-steer/core-agent/v3/pkg/usage"
+)
+
+// The cost preflight's review on #1327 reproduced each of these with a
+// probe that failed on the PR as submitted. Every one of them makes the
+// per-turn ceiling over-count or trip the wrong turn, and a preflight trip
+// advances the guardrail streak, so three false trips halt a session.
+
+func preflightTestAgent(ceiling float64) (*Agent, *usage.Tracker, *terminalRecorder) {
+	tr := usage.NewTracker()
+	a := &Agent{tracker: tr, modelName: pricedModel, costCeiling: CostCeiling{MaxTurnUSD: ceiling}}
+	rec := &terminalRecorder{}
+	rec.attachTo(a)
+	return a, tr, rec
+}
+
+func smallPreflightRequest() *adkmodel.LLMRequest {
+	return &adkmodel.LLMRequest{Model: pricedModel, Contents: []*genai.Content{genai.NewContentFromText("read foo.go", genai.RoleUser)}}
+}
+
+func bigPreflightRequest(chars int) *adkmodel.LLMRequest {
+	return &adkmodel.LLMRequest{Model: pricedModel, Contents: []*genai.Content{genai.NewContentFromText(strings.Repeat("x", chars), genai.RoleUser)}}
+}
+
+func retainedEstimates(a *Agent) (int, float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var usd float64
+	for _, e := range a.turnPreflightEstimates {
+		usd += e.usd
+	}
+	return len(a.turnPreflightEstimates), usd
+}
+
+// A child check that refuses means the request is never sent, so nothing
+// will settle the parent's estimate. The parent used to keep it anyway,
+// counting a phantom $0.04 against the rest of its turn.
+func TestPreflight_ChildRefusalLeavesNoParentEstimate(t *testing.T) {
+	t.Parallel()
+	a, _, _ := preflightTestAgent(1.0)
+	a.snapshotTurnStartCost()
+	ctx := withCostPreflight(context.Background(), a.preflightCostCeilingRequest)
+	ctx = withCostPreflight(ctx, func(preflightCall) (preflightRelease, error) {
+		return nil, &costPreflightError{reason: "child budget"}
+	})
+	if _, err := costPreflightFromContext(ctx)(preflightCall{req: bigPreflightRequest(400_000)}); err == nil {
+		t.Fatal("want the child's refusal")
+	}
+	if n, usd := retainedEstimates(a); n != 0 {
+		t.Errorf("a refused child request left %d parent estimate(s) ($%.6f) that no usage will ever settle", n, usd)
+	}
+}
+
+type failingPreflightLLM struct{}
+
+func (failingPreflightLLM) Name() string { return pricedModel }
+func (failingPreflightLLM) GenerateContent(context.Context, *adkmodel.LLMRequest, bool) iter.Seq2[*adkmodel.LLMResponse, error] {
+	return func(yield func(*adkmodel.LLMResponse, error) bool) { yield(nil, errors.New("503 unavailable")) }
+}
+
+// A provider error before any usage means none is on its way to the
+// tracker; the estimate for that request has nothing to settle it.
+func TestPreflight_FailedRequestLeavesNoEstimate(t *testing.T) {
+	t.Parallel()
+	a, _, _ := preflightTestAgent(1.0)
+	a.snapshotTurnStartCost()
+	ctx := withCostPreflight(context.Background(), a.preflightCostCeilingRequest)
+	for range newRoleSanitizingLLM(failingPreflightLLM{}, "", nil).GenerateContent(ctx, smallPreflightRequest(), false) {
+	}
+	if n, usd := retainedEstimates(a); n != 0 {
+		t.Errorf("a failed request (no usage) left %d retained estimate(s) ($%.6f)", n, usd)
+	}
+	a.mu.Lock()
+	reserved := a.turnPreflightReservedUSD
+	a.mu.Unlock()
+	if reserved != 0 {
+		t.Errorf("reservation after the failed request = $%.6f, want 0", reserved)
+	}
+}
+
+// A side call (summarizer, session title, /btw, approver, agentic
+// subtask, MCP digest) is not screened: refusing one would cut the turn
+// for a call the agent needs to keep working. The approver, subtasks and
+// digests also record through AppendSideUsage, which settlement does not
+// count, so a screened one's estimate stayed pending all turn while its
+// real cost was also counted: the same spend twice. (The summarizer,
+// title and /btw record through AppendUsage, which settlement counts.)
+func TestPreflight_SideCallsAreNotScreened(t *testing.T) {
+	t.Parallel()
+	screened := 0
+	ctx := withCostPreflight(context.Background(), func(preflightCall) (preflightRelease, error) {
+		screened++
+		return nil, nil
+	})
+	model := newRoleSanitizingLLM(failingPreflightLLM{}, "", nil)
+	for range model.GenerateContent(models.AsSideCall(ctx, "summarizer"), smallPreflightRequest(), false) {
+	}
+	if screened != 0 {
+		t.Errorf("a side call was screened %d time(s), want 0", screened)
+	}
+	for range model.GenerateContent(ctx, smallPreflightRequest(), false) {
+	}
+	if screened != 1 {
+		t.Errorf("the agent's own call was screened %d time(s), want 1: only side calls skip the check", screened)
+	}
+}
+
+// A request from another agent (a same-model subagent screened by its
+// parent's check) carries its own context. Pricing it at the parent's
+// measured window refused a ~10-token request after a 400K-token turn and
+// cut the turn at a $0.10 ceiling.
+func TestPreflight_AnotherAgentsRequestIsNotPricedAtThisAgentsWindow(t *testing.T) {
+	t.Parallel()
+	a, tr, rec := preflightTestAgent(0.10)
+	a.preflightOwner = &preflightOwner{}
+	tr.AppendUsage(pricedModel, usage.TurnUsage{InputTokens: 400_000, OutputTokens: 100}, usage.PriceFor(pricedModel, nil))
+	a.snapshotTurnStartCost()
+
+	child := &preflightOwner{}
+	release, err := a.preflightCostCeilingRequest(preflightCall{req: smallPreflightRequest(), owner: child})
+	if err != nil {
+		t.Fatalf("a small subagent request was refused at the parent's 400K window: %v", err)
+	}
+	release(true)
+	if trips := rec.guardrailTrips(); len(trips) != 0 {
+		t.Errorf("guardrail trips = %+v, want none", trips)
+	}
+
+	// The agent's own next request still continues the 400K conversation,
+	// so it is priced at that window and refused: the history still
+	// applies where it is true.
+	if _, err := a.preflightCostCeilingRequest(preflightCall{req: smallPreflightRequest(), owner: a.preflightOwner}); err == nil {
+		t.Error("the agent's own request was not priced at its measured 400K window")
+	}
+}
+
+// A background subagent's goroutine keeps the spawning turn's context
+// values (background/spawn.go, contextWithoutCancel), so it inherits that
+// turn's cost check. Once the turn is over, the check must not screen it.
+// One request used to emit a trip on the idle parent, latch
+// turnCeilingTripped and advance the streak.
+func TestPreflight_EndsWithItsTurn(t *testing.T) {
+	t.Parallel()
+	parent, _, rec := preflightTestAgent(0.05)
+	parent.snapshotTurnStartCost()
+	check, endTurn := parent.turnPreflight()
+	turnCtx := withCostPreflight(context.Background(), check)
+	bgCtx := context.WithoutCancel(turnCtx) // what the background goroutine gets
+
+	// A request in flight across the turn's end: it passed the check
+	// while the turn was live, and is released after it ended.
+	inFlight, err := costPreflightFromContext(turnCtx)(preflightCall{req: smallPreflightRequest()})
+	if err != nil {
+		t.Fatalf("in-turn request: %v", err)
+	}
+	endTurn()
+
+	if _, err := costPreflightFromContext(bgCtx)(preflightCall{req: bigPreflightRequest(800_000)}); err != nil {
+		t.Errorf("a background request after the turn ended was refused by that turn's ceiling: %v", err)
+	}
+	if trips := rec.guardrailTrips(); len(trips) != 0 {
+		t.Errorf("guardrail trips = %+v, want none: the turn the ceiling belongs to is over", trips)
+	}
+	parent.mu.Lock()
+	streak, latched := parent.turnCeilingStreak, parent.turnCeilingTripped
+	parent.mu.Unlock()
+	if streak != 0 || latched {
+		t.Errorf("parent streak = %d, latched = %v; want 0, false", streak, latched)
+	}
+
+	// The next turn starts with clean books, and the late release must
+	// not write the ended turn's estimate into them.
+	parent.snapshotTurnStartCost()
+	if inFlight != nil {
+		inFlight(true)
+	}
+	if n, usd := retainedEstimates(parent); n != 0 {
+		t.Errorf("a release after the turn ended left %d estimate(s) ($%.6f) in the next turn's books", n, usd)
+	}
+}
+
+// A refusal is decided under a.mu and tripped after it is released, so
+// the turn can end in between. The trip used to re-take the lock without
+// asking whose turn it was: the ended turn's refused request latched
+// turnCeilingTripped and advanced the streak on the next turn, and its
+// Interrupt cut that turn.
+func TestPreflight_TurnEndingBeforeTheTripLeavesTheNextTurnAlone(t *testing.T) {
+	t.Parallel()
+	a, _, rec := preflightTestAgent(0.000001)
+	a.snapshotTurnStartCost()
+	check, endTurn := a.turnPreflight()
+	nextCtx, cancelNext := context.WithCancel(context.Background())
+	defer cancelNext()
+	refused := false
+	a.testPreflightBeforeTrip = func() {
+		a.testPreflightBeforeTrip = nil
+		refused = true
+		endTurn()
+		a.snapshotTurnStartCost()
+		_, _ = a.turnPreflight()
+		a.setCancelInFlight(cancelNext) // the next turn is running
+	}
+
+	if _, err := check(preflightCall{req: bigPreflightRequest(400_000)}); err != nil {
+		t.Errorf("the ended turn's refusal reached its caller after the turn was over: %v", err)
+	}
+	if !refused {
+		t.Fatal("the request was never refused; this test would prove nothing")
+	}
+	if trips := rec.guardrailTrips(); len(trips) != 0 {
+		t.Errorf("guardrail trips = %+v, want none: the turn the refusal belonged to is over", trips)
+	}
+	a.mu.Lock()
+	streak, latched := a.turnCeilingStreak, a.turnCeilingTripped
+	a.mu.Unlock()
+	if streak != 0 || latched {
+		t.Errorf("next turn's streak = %d, latched = %v; want 0, false", streak, latched)
+	}
+	if nextCtx.Err() != nil {
+		t.Error("the ended turn's trip interrupted the next turn")
+	}
+}
+
+// The turn's end and the next turn's reset can land while a request is
+// between the check that its turn is live and the reservation. Checked
+// with a flag read before the reservation, the ended turn's request then
+// reserved into the new turn's books, and its release, seeing the turn
+// over, never took the reservation back: the new turn carried a phantom
+// spend all the way to its end.
+func TestPreflight_TurnEndingMidCheckLeavesTheNextTurnsBooksAlone(t *testing.T) {
+	t.Parallel()
+	a, _, rec := preflightTestAgent(1.0)
+	a.snapshotTurnStartCost()
+	check, endTurn := a.turnPreflight()
+	a.testPreflightBeforeReserve = func() {
+		a.testPreflightBeforeReserve = nil
+		endTurn()
+		a.snapshotTurnStartCost()
+		_, _ = a.turnPreflight() // the next turn binds its own check
+	}
+
+	release, err := check(preflightCall{req: smallPreflightRequest()})
+	if err != nil {
+		t.Fatalf("a request from the ended turn was refused: %v", err)
+	}
+	if release != nil {
+		release(true)
+	}
+	a.mu.Lock()
+	reserved := a.turnPreflightReservedUSD
+	a.mu.Unlock()
+	if reserved != 0 {
+		t.Errorf("the next turn's books hold $%.6f reserved by the ended turn's request, which nothing will release", reserved)
+	}
+	if n, usd := retainedEstimates(a); n != 0 {
+		t.Errorf("the next turn's books hold %d estimate(s) ($%.6f) from the ended turn", n, usd)
+	}
+	if trips := rec.guardrailTrips(); len(trips) != 0 {
+		t.Errorf("guardrail trips = %+v, want none", trips)
+	}
+}

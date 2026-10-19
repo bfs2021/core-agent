@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -457,8 +458,11 @@ func NewSubagentTool(opts SubagentOptions) (tool.Tool, error) {
 		var calls toolcalls.Recorder
 
 		var (
-			turns    int
-			spentUSD float64
+			turns       int
+			spentUSD    float64
+			costMu      sync.Mutex
+			reservedUSD float64
+			history     requestUsageHistory
 			// stopReason is non-empty once a cap has fired. It reads as
 			// prose because its only reader is the parent's model.
 			stopReason string
@@ -466,6 +470,65 @@ func NewSubagentTool(opts SubagentOptions) (tool.Tool, error) {
 			// model. Looked up once so the per-turn path is arithmetic.
 			price = opts.Inner.price(innerModelName)
 		)
+		if opts.Budgets.MaxCostUSD > 0 {
+			runCtx = withCostPreflight(runCtx, func(call preflightCall) (preflightRelease, error) {
+				// The budget screens every request under the delegation,
+				// a nested delegation's too. Only the subagent's own
+				// continue the conversation history measures, on its
+				// model; any other request is priced on its own model and
+				// backend from its own size, as the per-turn check does
+				// (preflightCostCeilingRequest).
+				reqModel, reqPrice, reqHistory := innerModelName, price, &history
+				if call.owner != opts.Inner.preflightOwner {
+					reqHistory = nil
+					if call.req != nil && call.req.Model != "" {
+						reqModel = call.req.Model
+					}
+					reqPrice = usage.PriceOn(call.backend, reqModel)
+				}
+				if reqPrice.Unpriced {
+					// Startup refuses a budget on an unpriced model; one
+					// that still arrives is skipped, never refused
+					// (warnUnpricedOnce says why).
+					backend := opts.Inner.BillingBackend()
+					if reqHistory == nil {
+						backend = call.backend
+					}
+					opts.Inner.warnUnpricedOnce(reqModel, backend)
+					return nil, nil
+				}
+				inputCost, err := estimateInputCost(call.req, reqModel, nil, reqHistory, reqPrice)
+				if err != nil {
+					return nil, err
+				}
+				costMu.Lock()
+				projected := spentUSD + reservedUSD + inputCost
+				if projected >= opts.Budgets.MaxCostUSD {
+					spent := spentUSD
+					costMu.Unlock()
+					return nil, &costPreflightError{reason: fmt.Sprintf(
+						"cost budget of $%.4f would be exceeded: $%.4f spent plus estimated input cost $%.4f is $%.4f; request refused before it was sent",
+						opts.Budgets.MaxCostUSD, spent, inputCost, projected,
+					)}
+				}
+				reservedUSD += inputCost
+				costMu.Unlock()
+				var once sync.Once
+				// The delegation keeps no retained estimates: settled
+				// spend is added from the runner's events below, so the
+				// release only frees the reservation.
+				return func(bool) {
+					once.Do(func() {
+						costMu.Lock()
+						reservedUSD -= inputCost
+						if reservedUSD < 0 {
+							reservedUSD = 0
+						}
+						costMu.Unlock()
+					})
+				}, nil
+			})
+		}
 		for ev, err := range r.Run(runCtx, innerUserID, subagentSessionID, msg, adkagent.RunConfig{
 			StreamingMode: opts.Inner.streaming,
 		}) {
@@ -478,9 +541,14 @@ func NewSubagentTool(opts SubagentOptions) (tool.Tool, error) {
 					stopReason = fmt.Sprintf("wall-clock budget of %s", opts.Budgets.MaxWallclock)
 					break
 				}
+				if isCostPreflightError(err) {
+					stopReason = err.Error()
+					break
+				}
 				turnErr = fmt.Errorf("subagent %q: run: %w", name, err)
 				return subagentResult{}, turnErr
 			}
+			history.addPendingContextBytes(contextGrowthBytes(ev))
 			collectFinalText(&sb, ev)
 			markIfServed(served, ev, err)
 			calls.Observe(ev)
@@ -489,6 +557,7 @@ func NewSubagentTool(opts SubagentOptions) (tool.Tool, error) {
 			if !ok {
 				continue
 			}
+			history.record(innerModelName, u)
 			turns++
 			if billTo != nil && innerModelName != "" {
 				billTo.AppendUsage(innerModelName, u, price)
@@ -496,18 +565,20 @@ func NewSubagentTool(opts SubagentOptions) (tool.Tool, error) {
 			// Priced whether or not there is a tracker: a cost cap is a
 			// safety limit, and it has to hold for a host that wired no
 			// ledger just as much as for one that did.
+			costMu.Lock()
 			spentUSD += price.CostUSDForTurn(u)
+			spent := spentUSD
+			costMu.Unlock()
 
-			// Caps are checked AFTER the turn is billed, so the turn
-			// that trips a cap is still on the books. Checked here
-			// rather than at the top of the loop because a turn arrives
-			// as many events and only the committing one is a turn.
+			// Turn-count caps are checked after the turn is billed. The
+			// cost cap also has a request preflight above; this settled
+			// check catches output spend the preflight cannot know.
 			if opts.Budgets.MaxTurns > 0 && turns >= opts.Budgets.MaxTurns {
 				stopReason = fmt.Sprintf("turn budget of %d", opts.Budgets.MaxTurns)
 				break
 			}
-			if opts.Budgets.MaxCostUSD > 0 && spentUSD >= opts.Budgets.MaxCostUSD {
-				stopReason = fmt.Sprintf("cost budget of $%.4f (spent $%.4f)", opts.Budgets.MaxCostUSD, spentUSD)
+			if opts.Budgets.MaxCostUSD > 0 && spent >= opts.Budgets.MaxCostUSD {
+				stopReason = fmt.Sprintf("cost budget of $%.4f (spent $%.4f)", opts.Budgets.MaxCostUSD, spent)
 				break
 			}
 		}

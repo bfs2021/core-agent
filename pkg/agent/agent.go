@@ -456,8 +456,30 @@ type Agent struct {
 	// turnCeilingStreak counts turns that ended in a per-turn trip, back
 	// to back, and is what escalates to a session halt. One turn that
 	// finishes inside its bound clears the streak.
-	turnCeilingTripped bool
-	turnCeilingStreak  int
+	turnCeilingTripped       bool
+	turnCeilingStreak        int
+	turnPreflightReservedUSD float64
+	turnPreflightEstimates   []costPreflightEstimate
+	turnPreflightBaseTurns   map[string]int
+	turnPreflightSettled     map[string]int
+	// turnPreflightGen names the turn whose cost check is live:
+	// turnPreflight bumps it when it binds a turn and again when that
+	// turn ends. A check or release carrying another generation belongs
+	// to a turn that is over and leaves the books above alone; it is
+	// read under mu with them, so the next turn's reset cannot slip in
+	// between the test and the write.
+	turnPreflightGen uint64
+	// testPreflightBeforeReserve runs between pricing a request and
+	// reserving its estimate, testPreflightBeforeTrip between refusing
+	// one and recording the trip. Nil outside tests.
+	testPreflightBeforeReserve func()
+	testPreflightBeforeTrip    func()
+	// preflightOwner marks this agent's own model calls to the cost
+	// preflight (preflightCall.owner); set by New, shared with the
+	// role-sanitizing wrapper. unpricedWarned is warnUnpricedOnce's
+	// once-per-model record, keyed "<backend>/<model>".
+	preflightOwner *preflightOwner
+	unpricedWarned map[string]bool
 
 	// Durable guardrail state (#643). pendingOutOfBandEvents queues
 	// trip/reset rows for a window with no turn in flight;
@@ -1008,16 +1030,18 @@ func New(model adkmodel.LLM, opts ...Option) (*Agent, error) {
 	if model == nil {
 		return nil, fmt.Errorf("agent: model is required")
 	}
-	// Strip role-less / invalid-role Content from every request before it
-	// reaches the provider (#614). Wrapped here so the ONE model value is
-	// sanitized on both the main-turn runner (llmagent below) and the
-	// internal summarizer/side-question paths (a.model). Outermost of any
-	// provider wrapper. See rolesanitize.go.
-	model = newRoleSanitizingLLM(model)
 	o := defaultOptions()
 	for _, opt := range opts {
 		opt(&o)
 	}
+	// Strip role-less / invalid-role Content from every request before it
+	// reaches the provider (#614). Wrapped here so the ONE model value is
+	// sanitized on both the main-turn runner (llmagent below) and the
+	// internal summarizer/side-question paths (a.model). Outermost of any
+	// provider wrapper. See rolesanitize.go. After the options, because
+	// the wrapper carries the billing backend to the cost preflight.
+	owner := &preflightOwner{}
+	model = newRoleSanitizingLLM(model, o.billingBackend, owner)
 
 	// Resolve subagents into tools. Done after all options are
 	// applied so each subagent tool captures the parent's final
@@ -1190,6 +1214,7 @@ func New(model adkmodel.LLM, opts ...Option) (*Agent, error) {
 
 	a := &Agent{
 		inner:                inner,
+		preflightOwner:       owner,
 		runner:               r,
 		sessionService:       svc,
 		eventLog:             o.eventLog,
@@ -1694,6 +1719,8 @@ func (a *Agent) Run(ctx context.Context, prompt string) iter.Seq2[*session.Event
 	// provider's retry policy. Always installed, even nil, so a Run
 	// nested under another agent's turn never reads that agent's.
 	runCtx = models.WithPriorSuccess(runCtx, a.priorSuccess)
+	preflight, endPreflight := a.turnPreflight()
+	runCtx = withCostPreflight(runCtx, preflight)
 	// And the auto-mode approver's view of this turn (#1175): the
 	// operator's task, the turn's earlier calls, the bill and the
 	// audit. Only with an approver wired; without it the gate never
@@ -1839,6 +1866,9 @@ func (a *Agent) Run(ctx context.Context, prompt string) iter.Seq2[*session.Event
 		// fully drained, so nothing still depends on runCtx (#359).
 		cancel()
 		a.clearCancelInFlight(cancelGen)
+		// The turn is over: its cost check must not screen calls made
+		// under its context from here on (a background subagent's).
+		endPreflight()
 		// Close the turn span here, in the same window as the cancel:
 		// the event stream has fully drained, so every child span ADK
 		// and the tool layer opened is already closed. The post-turn
@@ -2061,6 +2091,10 @@ func (a *Agent) RunWithContents(ctx context.Context, contents []*genai.Content) 
 		// above. Shadow any record inherited from a caller's turn, so a
 		// bare 400 here is never retried (#1247).
 		runCtx = models.WithPriorSuccess(runCtx, nil)
+		a.snapshotTurnStartCost()
+		preflight, endPreflight := a.turnPreflight()
+		defer endPreflight()
+		runCtx = withCostPreflight(runCtx, preflight)
 		for ev, err := range a.runner.Run(runCtx, a.userID, sessionID, last, adkagent.RunConfig{
 			StreamingMode: a.streaming,
 		}) {

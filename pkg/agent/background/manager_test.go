@@ -31,6 +31,7 @@ import (
 
 	"github.com/go-steer/core-agent/v3/pkg/agent"
 	"github.com/go-steer/core-agent/v3/pkg/agent/internal/subsession"
+	"github.com/go-steer/core-agent/v3/pkg/attach"
 	"github.com/go-steer/core-agent/v3/pkg/models"
 	"github.com/go-steer/core-agent/v3/pkg/models/mock"
 	"github.com/go-steer/core-agent/v3/pkg/usage"
@@ -107,6 +108,131 @@ func TestSpawn_ParentRequired(t *testing.T) {
 	})
 	if !errors.Is(err, ErrNoParent) {
 		t.Errorf("expected ErrNoParent; got %v", err)
+	}
+}
+
+// The spawn door of the host's unpriced-model policy: the check sees the
+// model and backend the spawn would bill on, and its refusal stops the
+// spawn before a slot is reserved or a model is built.
+func TestSpawn_PricingCheckRefusesBeforeLaunch(t *testing.T) {
+	t.Parallel()
+	prov := mock.NewEcho()
+	refusal := errors.New("cost ceiling: model has no price")
+	var got SpawnPricing
+	mgr, err := NewManager(
+		WithProvider(prov, "echo"),
+		WithSpawnPricingCheck(func(s SpawnPricing) error {
+			got = s
+			return refusal
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	newTestParent(t, mgr)
+	h, err := mgr.Spawn(context.Background(), "", Spec{Name: "x", SystemPrompt: "go", Goal: "go", ModelID: "house/model"})
+	if !errors.Is(err, refusal) || h != nil {
+		t.Fatalf("Spawn = (%v, %v), want the pricing check's refusal and no handle", h, err)
+	}
+	if got.ModelID != "house/model" || got.Backend != models.BackendOf(prov) {
+		t.Errorf("check asked about (%q, %q), want the spawn's model on the provider's backend %q", got.ModelID, got.Backend, models.BackendOf(prov))
+	}
+	if n := len(mgr.ListSubagents()); n != 0 {
+		t.Errorf("a refused spawn left %d subagent(s) registered", n)
+	}
+}
+
+// TestSpawn_PricingCheckIsToldWhoWroteTheBudget pins what the host's
+// unpriced-model policy needs from each door: the budget a spawn runs
+// under, and whether an operator wrote it. An attach caller's
+// max_cost_usd, a declared subagent's configured budget and a predefined
+// spec's own budget (even tightened) are explicit, so the host refuses
+// them on a model nobody prices; the manager default and a budget the
+// parent's model chose in spawn_agent are not, so the host only warns. If every door reported explicit=false, an operator's
+// budget would be silently counted at $0.
+func TestSpawn_PricingCheckIsToldWhoWroteTheBudget(t *testing.T) {
+	t.Parallel()
+	prov := mock.NewEcho()
+	refusal := errors.New("stop here")
+	echoFactory := func(c context.Context) (adkmodel.LLM, error) { return prov.Model(c, "m") }
+	var got []SpawnPricing
+	mgr, err := NewManager(
+		WithProvider(prov, "echo"),
+		WithSmallModelID("small-model"),
+		WithSubagentTemplates([]SubagentTemplate{
+			{Name: "budgeted", ModelFactory: echoFactory, ModelID: "m", Budgets: Budgets{MaxCost: 0.5}},
+			{Name: "plain", ModelFactory: echoFactory, ModelID: "m"},
+		}),
+		WithPredefinedSpecs([]Spec{
+			{Name: "curated", SystemPrompt: "go", Budgets: Budgets{MaxCost: 0.4}},
+			{Name: "uncurated", SystemPrompt: "go"},
+		}),
+		WithSpawnPricingCheck(func(s SpawnPricing) error {
+			got = append(got, s)
+			return refusal
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	newTestParent(t, mgr)
+	ctx := context.Background()
+	spec := func(budgets Budgets) Spec {
+		return Spec{Name: "x", SystemPrompt: "go", Goal: "go", Budgets: budgets}
+	}
+	steps := []struct {
+		door  string
+		spawn func() error
+		want  SpawnPricing
+	}{
+		{"spawn_agent, default budget", func() error { _, err := mgr.Spawn(ctx, "", spec(Budgets{})); return err },
+			SpawnPricing{MaxCost: 1.0}},
+		{"spawn_agent, model-written budget", func() error { _, err := mgr.Spawn(ctx, "", spec(Budgets{MaxCost: 3})); return err },
+			SpawnPricing{MaxCost: 3}},
+		{"attach, no budget", func() error {
+			_, err := mgr.SpawnSubagent(ctx, attach.SubagentSpec{Name: "x", SystemPrompt: "go", Goal: "go"})
+			return err
+		},
+			SpawnPricing{MaxCost: 1.0}},
+		{"attach, caller's budget", func() error {
+			_, err := mgr.SpawnSubagent(ctx, attach.SubagentSpec{Name: "x", SystemPrompt: "go", Goal: "go", Budgets: attach.SubagentBudget{MaxCostUSD: 2.5}})
+			return err
+		}, SpawnPricing{MaxCost: 2.5, MaxCostExplicit: true}},
+		{"declared subagent downshifted to small", func() error {
+			_, err := mgr.SpawnTemplate(ctx, "", "budgeted", RefOverrides{Goal: "go", Model: "small"}, "")
+			return err
+		}, SpawnPricing{ModelID: "small-model", MaxCost: 0.5, MaxCostExplicit: true}},
+		{"declared subagent with no budget", func() error {
+			_, err := mgr.SpawnTemplate(ctx, "", "plain", RefOverrides{Goal: "go"}, "")
+			return err
+		}, SpawnPricing{ModelID: "m", MaxCost: 1.0}},
+		{"predefined spec with its own budget", func() error {
+			_, err := mgr.SpawnRef(ctx, "", "curated", "go", RefOverrides{}, "")
+			return err
+		}, SpawnPricing{MaxCost: 0.4, MaxCostExplicit: true}},
+		{"predefined spec's budget tightened by the model", func() error {
+			_, err := mgr.SpawnRef(ctx, "", "curated", "go", RefOverrides{Budgets: Budgets{MaxCost: 0.2}}, "")
+			return err
+		}, SpawnPricing{MaxCost: 0.2, MaxCostExplicit: true}},
+		{"predefined spec with no budget, model-written", func() error {
+			_, err := mgr.SpawnRef(ctx, "", "uncurated", "go", RefOverrides{Budgets: Budgets{MaxCost: 3}}, "")
+			return err
+		}, SpawnPricing{MaxCost: 3}},
+	}
+	for i, step := range steps {
+		if err := step.spawn(); !errors.Is(err, refusal) {
+			t.Fatalf("%s: err = %v, want the pricing check's refusal", step.door, err)
+		}
+		if len(got) != i+1 {
+			t.Fatalf("%s: pricing check asked %d time(s), want %d", step.door, len(got), i+1)
+		}
+		g := got[i]
+		if g.MaxCost != step.want.MaxCost || g.MaxCostExplicit != step.want.MaxCostExplicit {
+			t.Errorf("%s: check saw MaxCost=$%.2f explicit=%v, want $%.2f explicit=%v", step.door, g.MaxCost, g.MaxCostExplicit, step.want.MaxCost, step.want.MaxCostExplicit)
+		}
+		if step.want.ModelID != "" && g.ModelID != step.want.ModelID {
+			t.Errorf("%s: check saw model %q, want %q", step.door, g.ModelID, step.want.ModelID)
+		}
 	}
 }
 

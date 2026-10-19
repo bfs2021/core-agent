@@ -17,11 +17,17 @@ package main
 import (
 	"flag"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/go-steer/core-agent/v3/pkg/agent"
+	"github.com/go-steer/core-agent/v3/pkg/agent/background"
+	"github.com/go-steer/core-agent/v3/pkg/compose"
 	"github.com/go-steer/core-agent/v3/pkg/config"
+	"github.com/go-steer/core-agent/v3/pkg/pricing"
+	"github.com/go-steer/core-agent/v3/pkg/usage"
 )
 
 func f64(v float64) *float64 { return &v }
@@ -312,28 +318,203 @@ func TestFlagWasSet(t *testing.T) {
 	}
 }
 
-func TestCheckProfileCeiling(t *testing.T) {
-	cfg := config.DefaultConfig()
-	cfg.Model.Provider = "vllm"
-	cfg.Model.Name = "house/model"
-	turn := agent.CostCeiling{MaxTurnUSD: 1}
-	session := agent.CostCeiling{MaxSessionUSD: 5}
+// unpricedTestModel is priced by no layer on any backend; pricedTestModel
+// is in the built-in table.
+const (
+	unpricedTestModel = "house/model"
+	pricedTestModel   = "gemini-2.5-flash"
+)
 
-	if _, err := checkProfileCeiling(cfg, turn, sourceCostUnset, true); err == nil || !strings.Contains(err.Error(), "models[].rates") {
-		t.Errorf("explicit turn ceiling on an unpriced profile model: err = %v, want a refusal naming the fix", err)
+func TestCeilingPricing_Check(t *testing.T) {
+	if !usage.PriceOn("", unpricedTestModel).Unpriced || usage.PriceOn(config.ProviderGemini, pricedTestModel).Unpriced {
+		t.Fatal("fixture models no longer isolate priced from unpriced")
 	}
-	if _, err := checkProfileCeiling(cfg, session, sourceCostFlag, true); err == nil {
-		t.Error("explicit session ceiling on an unpriced profile model was accepted")
+	turn := ceilingPricing{ceiling: agent.CostCeiling{MaxTurnUSD: 1}, sessionSource: sourceCostUnset}
+	sessionFlag := ceilingPricing{ceiling: agent.CostCeiling{MaxSessionUSD: 5}, sessionSource: sourceCostFlag}
+	unattended := ceilingPricing{ceiling: agent.CostCeiling{MaxSessionUSD: 10}, sessionSource: sourceCostUnattendedDefault}
+	none := ceilingPricing{sessionSource: sourceCostUnset}
+
+	for _, backend := range []string{"vllm", config.ProviderGemini} {
+		// Every provider now, not only profiles: a Gemini, Claude,
+		// OpenAI or xAI model can be unpriced too (a typo, or a model
+		// newer than the catalog).
+		if _, err := turn.check("model", unpricedTestModel, backend, 0); err == nil || !strings.Contains(err.Error(), "models[].rates") || !strings.Contains(err.Error(), "drop the ceiling") {
+			t.Errorf("%s: operator turn ceiling over an unpriced model: err = %v, want a refusal naming the remedies", backend, err)
+		}
+		if _, err := sessionFlag.check("model", unpricedTestModel, backend, 0); err == nil {
+			t.Errorf("%s: operator session ceiling over an unpriced model was accepted", backend)
+		}
+		warn, err := unattended.check("model", unpricedTestModel, backend, 0)
+		if err != nil || !strings.Contains(warn, "NOT protecting") {
+			t.Errorf("%s: unattended default: warn = %q, err = %v; want a warning and no refusal", backend, warn, err)
+		}
 	}
-	warn, err := checkProfileCeiling(cfg, session, sourceCostUnattendedDefault, true)
-	if err != nil || !strings.Contains(warn, "NOT protecting") {
-		t.Errorf("unattended default: warn = %q, err = %v; want a warning and no refusal", warn, err)
-	}
-	if warn, err := checkProfileCeiling(cfg, turn, sourceCostUnset, false); warn != "" || err != nil {
+	if warn, err := turn.check("model", pricedTestModel, config.ProviderGemini, 0); warn != "" || err != nil {
 		t.Errorf("priced model: %q, %v; want nothing", warn, err)
 	}
+	if warn, err := none.check("model", unpricedTestModel, "vllm", 0); warn != "" || err != nil {
+		t.Errorf("no ceiling at all: %q, %v; want nothing", warn, err)
+	}
+	// A subagent's own budget is always somebody's decision, and it
+	// cannot hold on an unpriced model: refused with or without a ceiling.
+	for _, p := range []ceilingPricing{none, unattended, turn} {
+		if _, err := p.check(`subagent "x": model`, unpricedTestModel, "vllm", 0.25); err == nil || !strings.Contains(err.Error(), "max_cost_usd") {
+			t.Errorf("budget on an unpriced model under %+v: err = %v, want a refusal naming the budget", p.ceiling, err)
+		}
+	}
+	// A budget on a priced model is fine.
+	if warn, err := turn.check("model", pricedTestModel, config.ProviderGemini, 0.25); warn != "" || err != nil {
+		t.Errorf("priced model with a budget: %q, %v; want nothing", warn, err)
+	}
+}
+
+func TestCeilingPricing_StartupReachesSubagentsAndTheSmallTier(t *testing.T) {
+	cfg := config.DefaultConfig()
 	cfg.Model.Provider = config.ProviderGemini
-	if warn, err := checkProfileCeiling(cfg, turn, sourceCostUnset, true); warn != "" || err != nil {
-		t.Errorf("core provider: %q, %v; the check is for profiles only", warn, err)
+	cfg.Model.Name = pricedTestModel
+	templates := []background.SubagentTemplate{
+		{Name: "ok", ModelID: pricedTestModel, Backend: config.ProviderGemini},
+		{Name: "selfhosted", ModelID: unpricedTestModel, Backend: "vllm"},
+		{Name: "budgeted", ModelID: unpricedTestModel, Backend: "vllm", Budgets: background.Budgets{MaxCost: 0.5}},
+	}
+	ms := startupCeilingModels(cfg, templates, "acme-small-unpriced")
+
+	turn := ceilingPricing{ceiling: agent.CostCeiling{MaxTurnUSD: 1}, sessionSource: sourceCostUnset}
+	_, err := turn.checkStartup(ms)
+	if err == nil {
+		t.Fatal("unpriced subagents and small tier under an operator ceiling were accepted")
+	}
+	for _, want := range []string{`subagent "selfhosted"`, `subagent "budgeted"`, "small-tier", "max_cost_usd"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("startup refusal does not name %q (all refusals are reported at once):\n%v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), `subagent "ok"`) {
+		t.Errorf("a priced subagent was refused:\n%v", err)
+	}
+
+	// Under only the unattended default, the ceiling refusals become
+	// warnings, but the declared budget still refuses.
+	unattended := ceilingPricing{ceiling: agent.CostCeiling{MaxSessionUSD: 10}, sessionSource: sourceCostUnattendedDefault}
+	warns, err := unattended.checkStartup(ms)
+	if err == nil || !strings.Contains(err.Error(), `subagent "budgeted"`) || strings.Contains(err.Error(), `subagent "selfhosted"`) {
+		t.Errorf("unattended default: err = %v, want only the budgeted subagent refused", err)
+	}
+	if len(warns) != 2 {
+		t.Errorf("unattended default warnings = %d (%q), want 2: the self-hosted subagent and the small tier", len(warns), warns)
+	}
+}
+
+// TestCeilingPricing_ZeroRatesEscapeHatchIsModelPricing pins the remedy
+// both halves of the unpriced-model policy name, through the real
+// config loader. A self-hosted model nobody pays per token for is
+// priced at $0 by zero rates in model.pricing. Zero rates in a profile's
+// models[].rates are not a way out: core-models rejects them at load,
+// so a message that suggested them sent the operator to a config that
+// does not start.
+func TestCeilingPricing_ZeroRatesEscapeHatchIsModelPricing(t *testing.T) {
+	t.Parallel()
+	load := func(t *testing.T, body string) (*config.Config, error) {
+		t.Helper()
+		agents := filepath.Join(t.TempDir(), ".agents")
+		if err := os.MkdirAll(agents, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(agents, config.ConfigFileName), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return config.Load(agents)
+	}
+	profile := func(rates string) string {
+		return `{"name":"house-vllm","extends":"vllm","base_url":"http://10.0.0.2:8000/v1",` +
+			`"models":[{"id":"` + unpricedTestModel + `"` + rates + `}]}`
+	}
+
+	t.Run("model.pricing zero rates are priced", func(t *testing.T) {
+		t.Parallel()
+		cfg, err := load(t, `{"version":1,"model":{"name":"`+unpricedTestModel+`","provider":"house-vllm",`+
+			`"pricing":{"`+unpricedTestModel+`":{"input_per_mtok":0,"output_per_mtok":0}}},"providers":[`+profile("")+`]}`)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		cat, err := pricing.NewCatalog(pricing.Options{
+			CfgOverride: compose.CfgToCatalogOverride(cfg.Model.Pricing),
+			Declared:    usage.DeclaredRates(cfg),
+		})
+		if err != nil {
+			t.Fatalf("NewCatalog: %v", err)
+		}
+		if _, _, found := cat.LookupForWithSource(usage.BackendFor(cfg), unpricedTestModel); !found {
+			t.Error("zero rates in model.pricing read as unpriced; the remedy the ceiling messages name would not work")
+		}
+	})
+
+	t.Run("profile zero rates are rejected at load", func(t *testing.T) {
+		t.Parallel()
+		_, err := load(t, `{"version":1,"model":{"name":"`+unpricedTestModel+`","provider":"house-vllm"},"providers":[`+
+			profile(`,"rates":{"input_per_mtok":0,"output_per_mtok":0}`)+`]}`)
+		if err == nil || !strings.Contains(err.Error(), "leave rates out instead") {
+			t.Fatalf("Load with all-zero profile rates = %v, want core-models' rejection", err)
+		}
+	})
+
+	if msg := unpricedCeilingWhy("model", unpricedTestModel, "vllm"); !strings.Contains(msg, "model.pricing") || strings.Contains(msg, "zero rates price") {
+		t.Errorf("the remedy must point a $0 model at model.pricing, not at zero profile rates:\n%s", msg)
+	}
+}
+
+func TestCeilingPricing_DoorWarnsOrRefuses(t *testing.T) {
+	turn := ceilingPricing{ceiling: agent.CostCeiling{MaxTurnUSD: 1}, sessionSource: sourceCostUnset}
+	if err := turn.door("model", unpricedTestModel, "vllm"); err == nil {
+		t.Error("/model to an unpriced model under an operator ceiling was allowed")
+	}
+	unattended := ceilingPricing{ceiling: agent.CostCeiling{MaxSessionUSD: 10}, sessionSource: sourceCostUnattendedDefault}
+	if err := unattended.door("model", unpricedTestModel, "vllm"); err != nil {
+		t.Errorf("under only the unattended default a door must warn, not refuse: %v", err)
+	}
+}
+
+// TestCeilingPricing_SpawnDoorVetsTheSpawnsBudget: with no ceiling at
+// all, a spawn on an unpriced model still runs under a dollar budget,
+// and that budget counts the subagent's calls as $0, so it can never
+// stop it. One an operator wrote (an attach caller's max_cost_usd) is
+// refused, as a declared subagent's is at startup. The manager default
+// and a budget the parent's model chose warn once per model instead:
+// every spawn carries the default, so refusing would refuse every spawn
+// on a self-hosted model.
+func TestCeilingPricing_SpawnDoorVetsTheSpawnsBudget(t *testing.T) {
+	t.Parallel()
+	none := ceilingPricing{sessionSource: sourceCostUnset}
+	spawn := func(model string, budget float64, explicit bool) background.SpawnPricing {
+		return background.SpawnPricing{ModelID: model, Backend: "vllm", MaxCost: budget, MaxCostExplicit: explicit}
+	}
+
+	var warned warnOnce
+	if _, err := none.spawnDoor(spawn(unpricedTestModel, 2.5, true), &warned); err == nil ||
+		!strings.Contains(err.Error(), "budgets.max_cost_usd ($2.50) cannot hold") || !strings.Contains(err.Error(), "model.pricing") {
+		t.Errorf("an attach caller's explicit budget on an unpriced model: err = %v, want a refusal naming the remedy", err)
+	}
+
+	warns, err := none.spawnDoor(spawn(unpricedTestModel, 1.0, false), &warned)
+	if err != nil {
+		t.Fatalf("the manager's default budget on an unpriced model was refused: %v", err)
+	}
+	if len(warns) != 1 || !strings.Contains(warns[0], "budgets.max_cost_usd ($1.00)") || !strings.Contains(warns[0], "cannot stop it") {
+		t.Errorf("default budget warnings = %q, want one saying the budget cannot stop the subagent", warns)
+	}
+	if warns, err := none.spawnDoor(spawn(unpricedTestModel, 3, false), &warned); err != nil || len(warns) != 0 {
+		t.Errorf("a second spawn on the same model (model-written budget) = (%q, %v), want allowed and no repeat warning", warns, err)
+	}
+	var fresh warnOnce
+	if warns, err := none.spawnDoor(spawn(unpricedTestModel, 3, false), &fresh); err != nil || len(warns) != 1 {
+		t.Errorf("a model-written budget on an unpriced model = (%q, %v), want allowed with one warning", warns, err)
+	}
+
+	if warns, err := none.spawnDoor(spawn(pricedTestModel, 2.5, true), &fresh); err != nil || len(warns) != 0 {
+		t.Errorf("an explicit budget on a priced model = (%q, %v), want allowed silently", warns, err)
+	}
+	turn := ceilingPricing{ceiling: agent.CostCeiling{MaxTurnUSD: 1}, sessionSource: sourceCostFlag}
+	if _, err := turn.spawnDoor(spawn(unpricedTestModel, 1.0, false), &fresh); err == nil {
+		t.Error("an operator ceiling no longer refuses a spawn on an unpriced model")
 	}
 }

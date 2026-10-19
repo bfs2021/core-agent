@@ -49,23 +49,35 @@ import (
 
 	adkmodel "google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
+
+	"github.com/go-steer/core-agent/v3/pkg/models"
 )
 
 // roleSanitizingLLM decorates an adkmodel.LLM, stripping Content whose
 // role Gemini would reject from each request before delegating.
 type roleSanitizingLLM struct {
 	inner adkmodel.LLM
+	// backend is the billing backend of the agent that owns this model
+	// (WithBillingBackend; "" is the process backend). It travels with
+	// each request to the cost preflight, so a check installed by an
+	// ancestor agent prices a subagent's request on the subagent's own
+	// backend rather than its own.
+	backend string
+	// owner identifies the agent this model belongs to, so the cost
+	// preflight can tell its own requests from a subagent's (see
+	// preflightCall.owner). nil outside agent.New.
+	owner *preflightOwner
 }
 
 // newRoleSanitizingLLM wraps inner so every GenerateContent request has
 // its Contents filtered to valid genai roles. Returns inner unchanged
 // when it is nil (agent.New rejects a nil model before this is called;
 // the guard keeps the wrapper safe for direct/test use).
-func newRoleSanitizingLLM(inner adkmodel.LLM) adkmodel.LLM {
+func newRoleSanitizingLLM(inner adkmodel.LLM, backend string, owner *preflightOwner) adkmodel.LLM {
 	if inner == nil {
 		return nil
 	}
-	return &roleSanitizingLLM{inner: inner}
+	return &roleSanitizingLLM{inner: inner, backend: backend, owner: owner}
 }
 
 // Name delegates to the wrapped model — the sanitizer is transparent to
@@ -86,7 +98,7 @@ func (l *roleSanitizingLLM) WithoutBuiltins() adkmodel.LLM {
 	if !ok {
 		return l
 	}
-	return newRoleSanitizingLLM(u.WithoutBuiltins())
+	return newRoleSanitizingLLM(u.WithoutBuiltins(), l.backend, l.owner)
 }
 
 // GenerateContent filters invalid-role Content out of req.Contents, then
@@ -108,7 +120,49 @@ func (l *roleSanitizingLLM) GenerateContent(ctx context.Context, req *adkmodel.L
 			req = &cp
 		}
 	}
+	// A side call (the summarizer, the session title, /btw, the
+	// approver, an agentic subtask, an MCP digest) is not screened.
+	// These are calls the agent needs to keep working, refusing one
+	// would cut the turn for the wrong reason, and their spend still
+	// counts toward the turn after the fact. For the approver, subtasks
+	// and digests there is a second reason: they record through
+	// AppendSideUsage, which settlement does not count, so a screened
+	// one left an estimate nothing settled and its cost was counted
+	// twice for the rest of the turn. The summarizer, the session title
+	// and /btw record through AppendUsage (recordInternalLLMUsage),
+	// which settlement does count; for them the first reason is the
+	// whole of it.
+	if check := costPreflightFromContext(ctx); check != nil && models.SideCallName(ctx) == "" {
+		return l.screened(ctx, check, req, stream)
+	}
 	return l.inner.GenerateContent(ctx, req, stream)
+}
+
+// screened runs req past check, then streams the provider's answer. The
+// release reports whether a usage-bearing response arrived: a request
+// that errored or produced nothing has no usage on its way to a tracker,
+// so its estimate is dropped rather than kept for a settlement that will
+// never come.
+func (l *roleSanitizingLLM) screened(ctx context.Context, check costPreflightCheck, req *adkmodel.LLMRequest, stream bool) iter.Seq2[*adkmodel.LLMResponse, error] {
+	return func(yield func(*adkmodel.LLMResponse, error) bool) {
+		release, err := check(preflightCall{req: req, backend: l.backend, owner: l.owner})
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		produced := false
+		if release != nil {
+			defer func() { release(produced) }()
+		}
+		for response, err := range l.inner.GenerateContent(ctx, req, stream) {
+			if err == nil && response != nil && !response.Partial && response.UsageMetadata != nil {
+				produced = true
+			}
+			if !yield(response, err) {
+				return
+			}
+		}
+	}
 }
 
 // emptyContentsPlaceholder is the user turn a request with no contents is
