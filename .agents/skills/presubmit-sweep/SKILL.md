@@ -37,6 +37,14 @@ Capture to a file and tail on failure rather than letting output stream. Some
 of these produce far more than a screen, and piping a long producer into
 `head` is how you get a SIGPIPE that looks like a crash.
 
+The loop is one compound command, and a permission gate's prefix rules never
+match a compound command, so it goes to a person for approval. To run the
+sweep as separate calls instead, list the directory and run each script as its
+own call, by its path and with nothing appended: `dev/ci/presubmits/build`,
+then `dev/ci/presubmits/vet`, and so on. Run from outside any git work tree,
+each script checks the tree it lives in, so an absolute path into another
+working copy works too.
+
 Three of them are the ones most often wrongly assumed to be conditional:
 
 - **`examples-smoke`** is unconditional in the required `test` job (#852). A

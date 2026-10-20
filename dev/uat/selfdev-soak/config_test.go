@@ -158,8 +158,10 @@ func checkApprover(t *testing.T, cfg *config.Config) {
 		t.Errorf("eligible_bundles = %v, want [coding]; the agent never pushes (decision 7), so no github preset", p.Auto.EligibleBundles)
 	}
 	// Exact, not a superset check: a widened pattern ("bash:*") hands the
-	// approver calls the design never made eligible.
-	if want := []string{"bash:dev/ci/presubmits/*", "bash:dev/tools/*"}; !reflect.DeepEqual(p.Auto.Eligible, want) {
+	// approver calls the design never made eligible. The three address
+	// the per-issue copies under the dispatcher's --worktrees-dir, which
+	// is how the task text tells the agent to work (dispatcher/task.go).
+	if want := []string{"bash:go -C /workspace/issues/*", "bash:git -C /workspace/issues/*", "bash:/workspace/issues/*"}; !reflect.DeepEqual(p.Auto.Eligible, want) {
 		t.Errorf("eligible = %v, want exactly %v (The auto recipe)", p.Auto.Eligible, want)
 	}
 	// Validate does not resolve bundle names; startup does, through this.
