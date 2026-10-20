@@ -258,7 +258,7 @@ header, which can't carry both credentials.
 The daemon sets no `GIT_AUTHOR_*` or `GIT_COMMITTER_*` variables. The
 dispatcher writes the soak's dedicated commit identity (decision 16, its
 `--commit-name` and `--commit-email`) into each working copy's local git
-config, so the agent's plain `git commit -s` produces it. An identity in
+config, so the agent's `git -C <copy> commit -s -F <file>` produces it. An identity in
 the daemon's environment would override that config, and the dispatcher
 refuses to push a commit whose author, committer or sign-off isn't the
 configured identity.

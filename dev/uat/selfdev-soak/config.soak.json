@@ -13,7 +13,7 @@
     "auto": {
       "model": "claude-haiku-4-5",
       "eligible_bundles": ["coding"],
-      "eligible": ["bash:dev/ci/presubmits/*", "bash:dev/tools/*"],
+      "eligible": ["bash:go -C /workspace/issues/*", "bash:git -C /workspace/issues/*", "bash:/workspace/issues/*"],
       "task_from": ["sa:selfdev-dispatcher"]
     }
   },
