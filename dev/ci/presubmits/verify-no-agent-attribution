@@ -16,4 +16,10 @@
 # CI delegator: no agent attribution in the PR's commits or its title
 # and body. See dev/tools/verify-no-agent-attribution.
 set -euo pipefail
-exec "$(dirname "$0")/../../tools/verify-no-agent-attribution" "$@"
+# The tool scans the repository it is run in (dev/uat/self-dev/run.sh
+# points it at a clone that way). Only outside any work tree does this
+# wrapper fall back to its own tree: there the tool found no origin/main
+# and skipped the scan with exit 0.
+here=$(cd "$(dirname "$0")" && pwd)
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || cd "${here}/../../.."
+exec "${here}/../../tools/verify-no-agent-attribution" "$@"

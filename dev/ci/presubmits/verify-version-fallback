@@ -15,6 +15,12 @@
 
 set -euo pipefail
 
+# Every git call below reads the current repository, which is the point:
+# the self-dev dispatcher runs this check inside a copy
+# (dispatcher/tags_test.go). Only outside any work tree does it fall back
+# to its own tree, where it used to find no tags and fail.
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || cd "$(dirname "$0")/../../.."
+
 # Latest RELEASE tag. Exclude pre-releases: SemVer says any hyphen
 # after the version triple denotes a pre-release (v2.7.0-dev.1,
 # v2.7.0-rc.1, ...). Sort by version-aware refname so newest lands
