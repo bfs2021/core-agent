@@ -16,6 +16,10 @@ The `extras/` adapters (`extras/scion-agent/`, `extras/ax-agent/`) and the `inte
 
 ## [Unreleased]
 
+_No unreleased changes since [3.0.0-dev.2]._
+
+## [3.0.0-dev.2] — 2026-10-20
+
 ### Breaking Changes
 
 - **`pkg/pricing` is now core-models' shared price catalog, re-exported.** Its types are aliases of `github.com/go-steer/core-models/pricing` (v0.13.1), so a `pricing.Rates` or `pricing.Catalog` from core-agent *is* the core-models value. Every exported name keeps compiling; two things change. `Rates` and `ModelRates` gain a `LongContext` field, so an unkeyed composite literal of either no longer compiles (keyed literals are unaffected). `Rates.CostUSD*` bill a prompt over the model's long-context threshold at the long-context rate, which is higher; see the fix below. The generator `dev/regen-builtin-pricing` and the weekly `pricing-regen` workflow are gone: the table is regenerated in core-models for both core-agent and mast, and reaches core-agent by a version bump. The release guards now check the pinned table with `dev/tools/verify-pricing-fresh`, which runs core-models' generator in `--check` mode. ([#1328](https://github.com/go-steer/core-agent/pull/1328))
