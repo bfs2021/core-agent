@@ -161,6 +161,28 @@ RUN cd /src; \
     rm -rf /out/recipe/.agents/plans; \
     mkdir -p /out/recipe/.agents/plans
 
+# The agent builds and tests a clone of the mirror, which tracks this
+# same ref, but the daemon's egress policy reaches proxy.golang.org and
+# not storage.googleapis.com, where the proxy serves module zips. In A7's
+# second run that meant nothing compiled. So the image carries a module
+# proxy for this ref's go.mod (the download cache is in GOPROXY's file
+# layout; the runtime GOPROXY is it alone, then off, so a module outside
+# this go.mod fails at once instead of timing out), and the three tools the
+# presubmits would otherwise `go install` at run time: golangci-lint at
+# the version dev/tools/lint-go pins, goimports and govulncheck.
+# dev/tools/common.sh's ensure_tool takes a binary already on PATH.
+RUN cd /src; \
+    go mod download all; \
+    lint="$(sed -n 's/^GOLANGCI_LINT_VERSION="\(v[^"]*\)"$/\1/p' dev/tools/lint-go)"; \
+    if [[ -z "${lint}" ]]; then \
+      echo "selfdev-soak: no GOLANGCI_LINT_VERSION in dev/tools/lint-go" >&2; \
+      exit 1; \
+    fi; \
+    GOBIN=/out/tools go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${lint}"; \
+    GOBIN=/out/tools go install golang.org/x/tools/cmd/goimports@latest; \
+    GOBIN=/out/tools go install golang.org/x/vuln/cmd/govulncheck@latest; \
+    cp -a "$(go env GOMODCACHE)/cache/download" /out/goproxy
+
 # ---- Runtime stage ----
 # The same pinned image: it already carries git, a shell, coreutils,
 # ca-certificates, python3, gcc (for -race) and the Go toolchain, so one
@@ -212,13 +234,15 @@ COPY --from=builder /out/core-agent /usr/local/bin/core-agent
 COPY --from=builder /out/core-agent.ref /out/core-agent.commit /usr/local/share/core-agent-soak/
 COPY --from=builder /out/selfdev-soak-dispatcher /usr/local/bin/selfdev-soak-dispatcher
 COPY --from=builder /out/recipe /usr/local/share/core-agent-soak/recipe
+COPY --from=builder /out/tools/ /usr/local/bin/
+COPY --from=builder /out/goproxy /usr/local/share/core-agent-soak/goproxy
 
 # Mount points, documented in README.md:
 #   /workspace                          workspace PVC (the mirror's clone + worktrees)
 #   /cache/go                           Go module + build cache PVC, and
-#                                       GOPATH, so `go install`ed dev tools
-#                                       (golangci-lint, govulncheck) survive
-#                                       a pod restart. Its bin is LAST on
+#                                       GOPATH (the presubmits' dev tools
+#                                       are prebuilt in /usr/local/bin,
+#                                       above). Its bin is LAST on
 #                                       PATH: it is writable and persists
 #                                       across issues, so first on PATH it
 #                                       would let one issue's session shadow
@@ -234,7 +258,8 @@ ENV HOME=/home/soak \
     PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/cache/go/path/bin \
     GOMODCACHE=/cache/go/mod \
     GOCACHE=/cache/go/build \
-    GOTOOLCHAIN=local
+    GOTOOLCHAIN=local \
+    GOPROXY=file:///usr/local/share/core-agent-soak/goproxy,off
 
 WORKDIR /workspace
 USER 10001:10001

@@ -113,8 +113,17 @@ func TestTaskCommands_ReachTheApprover(t *testing.T) {
 	}
 	for _, c := range cmds {
 		if pol.Match("bash", c) != permissions.OutcomeAllow {
-			t.Errorf("the task text names %q, which is not on the approver's eligible list: it would go to a person", c)
+			t.Errorf("the task text names %q, which is not on the approver's eligible list: the approver would not judge it", c)
 		}
+	}
+
+	// The text asks for the recipe's reviewer subagent. In A7's second
+	// run spawning it was not eligible, and the review never happened.
+	if !strings.Contains(rules, "`reviewer` tool") {
+		t.Error("the task text no longer asks for the reviewer; update this check with it")
+	}
+	if pol.Match("spawn_agent", "reviewer") != permissions.OutcomeAllow {
+		t.Error("the task text asks for the reviewer, but calling it is not approver-eligible")
 	}
 
 	// The commit message file the text names is written with write_file.
@@ -122,7 +131,7 @@ func TestTaskCommands_ReachTheApprover(t *testing.T) {
 		t.Errorf("write_file %s is not approver-eligible", msg)
 	}
 
-	// The text says these shapes go to a person. If one became eligible,
+	// The text says the approver does not judge these shapes. If one became eligible,
 	// the text would be wrong, and the design's guard with it.
 	test := "go -C " + dir + " test ./pkg/agent/"
 	for _, c := range []string{
@@ -134,7 +143,7 @@ func TestTaskCommands_ReachTheApprover(t *testing.T) {
 		"go -C '" + dir + "' test ./pkg/agent/",
 	} {
 		if pol.Match("bash", c) == permissions.OutcomeAllow {
-			t.Errorf("%q is approver-eligible, but the task text says it goes to a person", c)
+			t.Errorf("%q is approver-eligible, but the task text says the approver does not judge it", c)
 		}
 	}
 }

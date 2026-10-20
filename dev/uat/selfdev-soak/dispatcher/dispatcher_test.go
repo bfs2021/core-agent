@@ -60,7 +60,7 @@ func TestOnceOpensPRFromAgentCommits(t *testing.T) {
 		t.Fatalf("created %d PRs, want 1", len(prs))
 	}
 	body, _ := prs[0]["body"].(string)
-	for _, want := range []string{"Fixes #1", testUpstream, "`sess-1`", "1. Fix the recovery half."} {
+	for _, want := range []string{"Fixes #1", testUpstream, "`sess-1`", "1. Fix the recovery half.", "## Commits", "fix: recover the half that was broken"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("PR body lacks %q:\n%s", want, body)
 		}

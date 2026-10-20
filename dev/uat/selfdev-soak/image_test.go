@@ -408,3 +408,49 @@ func TestDockerfileShipsDispatcherAndRecipe(t *testing.T) {
 		}
 	}
 }
+
+// TestDockerfileBakesModulesAndTools: the daemon's egress reaches
+// proxy.golang.org but not storage.googleapis.com, where it serves module
+// zips, so in A7's second run nothing compiled. The image carries a module
+// proxy for its ref, GOPROXY is that proxy alone, and the presubmits' dev
+// tools are prebuilt, golangci-lint at the version lint-go pins.
+func TestDockerfileBakesModulesAndTools(t *testing.T) {
+	ins := parseDockerfile(t)
+	for _, want := range []string{
+		`go mod download all`,
+		`lint="$(sed -n 's/^GOLANGCI_LINT_VERSION="\(v[^"]*\)"$/\1/p' dev/tools/lint-go)"`,
+		`GOBIN=/out/tools go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${lint}"`,
+		`cp -a "$(go env GOMODCACHE)/cache/download" /out/goproxy`,
+	} {
+		if !hasRun(ins, want) {
+			t.Errorf("the builder no longer runs %s", want)
+		}
+	}
+	st := stages(ins)
+	var copies, env []string
+	for _, in := range st[len(st)-1] {
+		switch in.op {
+		case "COPY":
+			copies = append(copies, in.args)
+		case "ENV":
+			env = append(env, in.args)
+		}
+	}
+	for _, want := range []string{"/out/tools/ /usr/local/bin/", "/out/goproxy /usr/local/share/core-agent-soak/goproxy"} {
+		if !strings.Contains(strings.Join(copies, "\n"), want) {
+			t.Errorf("the runtime stage no longer copies %s", want)
+		}
+	}
+	if !strings.Contains(strings.Join(env, "\n"), "GOPROXY=file:///usr/local/share/core-agent-soak/goproxy,off") {
+		t.Error("GOPROXY is not the baked proxy alone; a missing module would reach for storage.googleapis.com and time out")
+	}
+
+	// The extraction must match lint-go's actual pin line.
+	raw, err := os.ReadFile(filepath.Join("..", "..", "tools", "lint-go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile(`(?m)^GOLANGCI_LINT_VERSION="v[^"]*"$`).Match(raw) {
+		t.Error(`dev/tools/lint-go no longer has a GOLANGCI_LINT_VERSION="vX.Y.Z" line; the image build would fail`)
+	}
+}

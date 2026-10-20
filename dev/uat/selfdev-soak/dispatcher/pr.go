@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // maxPlanBytes keeps the PR body under GitHub's 65536-character limit
@@ -155,13 +156,31 @@ func prTitle(a *activeIssue, commits []commit) string {
 	return a.Title
 }
 
+// minCommitsBytes is what the commit messages quoted in a PR body always
+// get, however long the plan. GitHub refuses a body over 65536
+// characters, and the plan and the messages are both agent-written, so
+// they share maxPlanBytes: the messages get what the plan leaves, and at
+// least this much, and the plan is cut to fit them.
+const minCommitsBytes = 16000
+
 // prBody links the mirror issue (Fixes #N closes it on merge), the
-// upstream issue (decision 12), and the session that did the work.
-func prBody(a *activeIssue, repo, plan string) string {
+// upstream issue (decision 12), and the session that did the work, and
+// quotes the session's plan and its commit messages.
+//
+// The commit messages are there because the agent can't edit the PR
+// body: the dispatcher writes it. They are where the task text tells the
+// agent to record its adversarial review, which the repository's
+// review-gate check requires on any PR that touches Go code. In A7's
+// second run nothing in the body could carry it.
+func prBody(a *activeIssue, repo, plan string, commits []commit) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Fixes #%d\n\n", a.Number)
 	fmt.Fprintf(&b, "Upstream issue: %s\n\n", a.Upstream)
 	fmt.Fprintf(&b, "Session: `%s` on the soak daemon. Branch `%s` was committed by that session and pushed by the soak dispatcher, from %s base `%s`.\n\n", a.SessionID, branchFor(a.Number), repo, a.BaseSHA)
+	messages := commitMessages(commits, max(minCommitsBytes, maxPlanBytes-len(plan)))
+	if budget := maxPlanBytes - len(messages); len(plan) > budget {
+		plan = truncate(plan, budget)
+	}
 	b.WriteString("## Plan\n\n")
 	if plan == "" {
 		b.WriteString("The session recorded no plan artifact.\n")
@@ -169,7 +188,37 @@ func prBody(a *activeIssue, repo, plan string) string {
 		b.WriteString(plan)
 		b.WriteString("\n")
 	}
+	b.WriteString("\n## Commits\n\n")
+	b.WriteString(messages)
 	return b.String()
+}
+
+// commitMessages renders commits oldest first, each as its short SHA
+// and full message, with issue closers neutralized, in at most budget
+// bytes. A cut drops the START: the task text puts the review at the end
+// of a commit body, and the newest commit is last, so the end is the
+// part review-gate needs.
+func commitMessages(commits []commit, budget int) string {
+	var b strings.Builder
+	for i := len(commits) - 1; i >= 0; i-- { // git log lists newest first
+		c := commits[i]
+		sha := c.SHA
+		if len(sha) > 12 {
+			sha = sha[:12]
+		}
+		fmt.Fprintf(&b, "`%s`\n\n%s\n\n", sha, strings.TrimSpace(neutralizeClosers(c.Message)))
+	}
+	out := b.String()
+	if len(out) > budget {
+		const marker = "[earlier commit text truncated] "
+		tail := out[len(out)-(budget-len(marker)):]
+		// Start on a rune boundary: drop continuation bytes.
+		for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+			tail = tail[1:]
+		}
+		out = marker + tail
+	}
+	return out
 }
 
 func stopComment(a *activeIssue, reason string) string {
