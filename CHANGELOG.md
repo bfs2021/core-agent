@@ -16,7 +16,9 @@ The `extras/` adapters (`extras/scion-agent/`, `extras/ax-agent/`) and the `inte
 
 ## [Unreleased]
 
-_No unreleased changes since [3.0.0-dev.2]._
+#### Documentation
+
+- **The `presubmit-sweep` skill now says its loop is one compound command.** A permission gate's prefix rules never match a compound command, so under an approver the loop goes to a person. The skill now says how to run the scripts as separate calls, by path. ([#1341](https://github.com/go-steer/core-agent/pull/1341))
 
 ## [3.0.0-dev.2] — 2026-10-20
 
