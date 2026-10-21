@@ -16,7 +16,9 @@ The `extras/` adapters (`extras/scion-agent/`, `extras/ax-agent/`) and the `inte
 
 ## [Unreleased]
 
-_No unreleased changes since [3.0.0-dev.4]._
+#### Security
+
+- **Builds on Go 1.26.10, for GO-2026-6809.** A `crypto/x509` certificate-verification vulnerability in go1.26.9 is reachable through the attach server's HTTP stack. `go.mod`'s `toolchain` line, the Dockerfiles and the release images move to go1.26.10. The `go 1.26.6` floor for embedders is unchanged, so an embedder building on an older toolchain should upgrade it. ([#1346](https://github.com/go-steer/core-agent/pull/1346))
 
 ## [3.0.0-dev.4] — 2026-10-20
 
