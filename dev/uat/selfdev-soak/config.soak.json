@@ -15,7 +15,8 @@
       "eligible_bundles": ["coding"],
       "eligible": ["bash:go -C /workspace/issues/*", "bash:git -C /workspace/issues/*", "bash:/workspace/issues/*", "spawn_agent:reviewer"],
       "task_from": ["sa:selfdev-dispatcher"],
-      "escalation": "refuse"
+      "escalation": "refuse",
+      "instructions_file": "/etc/core-agent-soak/approver-instructions.md"
     }
   },
   "safety": {

@@ -125,6 +125,7 @@ trap "rm -rf '${WORK}'" EXIT
 
 cp -R "${SELF_DIR}" "${WORK}/deploy"
 cp "${SOAK_DIR}/config.soak.json" "${WORK}/deploy/base/config.soak.json"
+cp "${SOAK_DIR}/approver-instructions.md" "${WORK}/deploy/base/approver-instructions.md"
 cp "${INPUTS}" "${WORK}/deploy/base/inputs.env"
 cp "${INPUTS}" "${WORK}/deploy/a7-job/inputs.env"
 

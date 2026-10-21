@@ -171,6 +171,11 @@ func checkApprover(t *testing.T, cfg *config.Config) {
 	if !p.Auto.RefusesEscalation() {
 		t.Errorf("escalation = %q, want %q (The auto recipe)", p.Auto.Escalation, config.AutoEscalationRefuse)
 	}
+	// The deployment's addition to the approver's policy, projected from
+	// the config ConfigMap (render_test.go checks the mount).
+	if want := "/etc/core-agent-soak/approver-instructions.md"; p.Auto.InstructionsFile != want {
+		t.Errorf("instructions_file = %q, want %q (The auto recipe)", p.Auto.InstructionsFile, want)
+	}
 	// Validate does not resolve bundle names; startup does, through this.
 	if _, err := permissions.ResolveAutoEligible(p.Auto.Eligible, p.Auto.EligibleBundles); err != nil {
 		t.Errorf("auto eligibility does not resolve: %v", err)

@@ -174,6 +174,7 @@ the arguments after them are ignored. To use them inside the pod, run
 | `/cache/go` | PVC, read-write | Go caches: `GOMODCACHE=/cache/go/mod`, `GOCACHE=/cache/go/build`, and `GOPATH=/cache/go/path`. Keeps `go test` and the installed dev tools warm across issues and restarts. |
 | `/var/lib/core-agent` | PVC, read-write | The eventlog. Pass `--session-db-path=/var/lib/core-agent/sessions.db`. |
 | `/etc/core-agent-soak/config.json` | ConfigMap, read-only | The config overlay, `config.soak.json`. |
+| `/etc/core-agent-soak/approver-instructions.md` | ConfigMap, read-only | The approver's instructions for this deployment (`permissions.auto.instructions_file`). Eval: `go run ./dev/smoke/cmd/approvereval --cases dev/evals/approver-soak --model claude-haiku-4-5 --instructions dev/uat/selfdev-soak/approver-instructions.md`. |
 | `/etc/core-agent-users/users.json` | Secret, read-only | The hashed bearer table the overlay's `attach.multi_session` names. |
 | `/usr/local/share/core-agent-soak/recipe/.agents/plans` | the workspace PVC, `subPath: .soak/plans` | The one writable spot in the recipe. `record_plan` writes here, and the dispatcher reads the same directory as `/workspace/.soak/plans` for the PR body. |
 
@@ -379,14 +380,15 @@ their volumes, and the network policy between them.
 
 ### Inputs fail closed
 
-The base reads two files that aren't in the tree: `inputs.env` and
-`config.soak.json` (`a7-job/` reads `inputs.env` too, for the image).
+The base reads three files that aren't in its directory: `inputs.env`,
+`config.soak.json` and `approver-instructions.md` (`a7-job/` reads
+`inputs.env` too, for the image).
 `render.sh` copies `deploy/` to a temporary directory,
 adds them, renders, and prints the result only if every input is filled
 in, `SOAK_IMAGE` is `<repository>@sha256:<64 hex>`, the output contains no
 `REPLACE`, and every image in it is a digest. Anything else exits non-zero
 with nothing on stdout, so a pipe into `kubectl` applies nothing.
-`kubectl apply -k deploy/base` fails outright, because neither file is
+`kubectl apply -k deploy/base` fails outright, because none of them is
 there.
 
 Each placeholder also fails on its own if applied anyway: the image

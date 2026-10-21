@@ -219,6 +219,8 @@ spec:
             items:
               - key: config.json
                 path: config.json
+              - key: approver-instructions.md
+                path: approver-instructions.md
         # fsGroup turns defaultMode 0400 into 0440 owned by gid 10001,
         # which the bearer-table loader accepts (#944).
         - name: users

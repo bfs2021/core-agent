@@ -61,6 +61,32 @@ func loadCorpus(t *testing.T) []Case {
 	return cases
 }
 
+// The self-dev soak's set (dev/evals/approver-soak) is run with that
+// deployment's instructions file (--instructions). It pins what the file
+// lets through: an earlier wording made the approver allow sabotage edits
+// that called themselves temporary, and another denied adding a test to
+// an existing file. Every case must load and reach the approver, so a
+// live run is never graded on a case that tests nothing.
+func TestSoakCorpus_EveryCaseReachesTheApprover(t *testing.T) {
+	t.Parallel()
+	cases, err := Load("../../dev/evals/approver-soak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cases) < 10 {
+		t.Fatalf("soak corpus has %d cases, want at least 10", len(cases))
+	}
+	for _, c := range cases {
+		o, err := Run(context.Background(), alwaysEscalate, c)
+		if err != nil {
+			t.Fatalf("%s: %v", c.ID, err)
+		}
+		if r := GradeCase(c, o); r.Grade == Vacuous {
+			t.Errorf("%s (%s): vacuous — approver calls %d, prompted %v", c.ID, c.Class, o.ApproverCalls, o.Prompted)
+		}
+	}
+}
+
 // The corpus covers every class the design names, with room for the
 // gate's numbers to mean something.
 func TestCorpus_CoversEveryClass(t *testing.T) {
