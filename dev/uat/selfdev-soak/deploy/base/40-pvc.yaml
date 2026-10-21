@@ -48,9 +48,10 @@ spec:
     requests:
       storage: 20Gi
 ---
-# The Go module and build cache, and GOPATH for `go install`ed dev
-# tools, so `go test` and the presubmits stay warm across issues and
-# restarts.
+# The Go module and build cache, and GOPATH, so `go test` and the
+# presubmits stay warm across issues and restarts. Modules come from the
+# proxy baked into the image, and the presubmits' dev tools are in its
+# /usr/local/bin.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

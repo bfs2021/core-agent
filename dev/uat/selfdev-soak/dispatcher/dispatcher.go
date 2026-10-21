@@ -349,7 +349,7 @@ func (d *dispatcher) openOrAdoptPR(ctx context.Context, a *activeIssue, commits 
 		d.log.Warn("withholding the plan from the PR body: it carries agent attribution", "issue", a.Number)
 		plan = "(The session's plan artifact was withheld: it carries text the attribution check fails.)"
 	}
-	body := prBody(a, d.cfg.Owner+"/"+d.cfg.Repo, plan)
+	body := prBody(a, d.cfg.Owner+"/"+d.cfg.Repo, plan, commits)
 	if line := attributionLine(body); line != "" {
 		return ghPull{}, fmt.Errorf("the PR body fails the attribution check (%q)", truncate(line, 120))
 	}

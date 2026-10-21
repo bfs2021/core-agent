@@ -43,11 +43,24 @@ The image contains:
   bookworm's archive. jq is the one package not pinned by digest.
   `verify-gke-drill` needs both jq and python3, and the presubmit sweep runs
   it.
+- **A Go module proxy for the image's ref, and the presubmits' dev tools
+  prebuilt.** The builder runs `go mod download all` and copies the download
+  cache to `/usr/local/share/core-agent-soak/goproxy`. `GOPROXY` is
+  `file:///usr/local/share/core-agent-soak/goproxy,off`, so a module outside
+  the ref's `go.mod` fails at once with a clear error.
+  - **Why it's baked in:** the egress policy reaches `proxy.golang.org`,
+    which serves large module zips from `storage.googleapis.com`, and that
+    host stays closed, so nothing compiled in A7's second run.
+  - **The tools:** golangci-lint (at the version `dev/tools/lint-go` pins),
+    goimports and govulncheck are in `/usr/local/bin`, so `ensure_tool`
+    installs nothing.
+  - **The mirror's base must track the image's ref** for the modules to
+    match. When the image moves to a ref whose `go.mod` changed, re-sync the
+    mirror.
 - **`GOPATH` on the Go cache volume** (`/cache/go/path`), with its `bin`
-  **last** on `PATH`. Dev tools that the presubmits `go install`
-  (golangci-lint, govulncheck) then survive a pod restart. The directory is
-  writable and outlives each issue's session. If it came first on `PATH`,
-  one session could shadow `git` or `go` for every later issue.
+  **last** on `PATH`. The directory is writable and outlives each issue's
+  session. If it came first on `PATH`, one session could shadow `git` or
+  `go` for every later issue.
 - **No setuid or setgid binaries.** The runtime stage strips every such bit
   (`su`, `passwd`, `mount`, ...).
 - **A core-agent binary built from a pinned upstream ref** (next section).

@@ -104,7 +104,7 @@ replacements:
   # The soak Slack channel, into the switchboard target's `conversation`
   # inside config.json. A replacement cannot address a field inside a
   # JSON string, so this splits the file on `"` and replaces one
-  # segment: index 105 is the segment holding config.soak.json's
+  # segment: index 111 is the segment holding config.soak.json's
   # placeholder. Editing config.soak.json above that line moves the
   # index; render_test.go fails then and prints the new one. A missing
   # SOAK_SLACK_CHANNEL fails the render, and the shipped placeholder
@@ -121,4 +121,4 @@ replacements:
           - data.[config.json]
         options:
           delimiter: '"'
-          index: 105
+          index: 111

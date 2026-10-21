@@ -13,8 +13,9 @@
     "auto": {
       "model": "claude-haiku-4-5",
       "eligible_bundles": ["coding"],
-      "eligible": ["bash:go -C /workspace/issues/*", "bash:git -C /workspace/issues/*", "bash:/workspace/issues/*"],
-      "task_from": ["sa:selfdev-dispatcher"]
+      "eligible": ["bash:go -C /workspace/issues/*", "bash:git -C /workspace/issues/*", "bash:/workspace/issues/*", "spawn_agent:reviewer"],
+      "task_from": ["sa:selfdev-dispatcher"],
+      "escalation": "refuse"
     }
   },
   "safety": {

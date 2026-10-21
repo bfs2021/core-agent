@@ -74,6 +74,10 @@ poll (2m) ── soak:pause open? ── yes ──▶ hold
     - **Before the agent sees the copy.** All of this runs before the agent has the copy. `GIT_NO_LAZY_FETCH=1`, the hardening `-c` flags and the copy checks are unchanged.
     - **No tag object rides along with the clone.** The private repo keeps the fetched tags under `refs/upstream-tags/`, not `refs/tags/`. A clone sends the annotated tag object of every `refs/tags/*` entry that points at a commit it sends (include-tag, even with `--no-tags`), which would have put the message of any annotated tag on the base, a pre-release included, into the copy. `git fsck` in a copy reports no dangling tag.
     - **The note names no place to read history.** The public upstream repository's history still holds the seed list, so the note must not point there. A worker with GitHub egress could still reach upstream without a hint. That gap predates this decision and lies outside the copy; it is tracked separately from this change.
+25. **The PR body quotes the commit messages** *(added 2026-10-20, after A7's second run)*. The agent can't edit the PR body, because the dispatcher writes it. But the repository's required review-gate check fails a Go-touching PR whose body never says "adversarial review", and the writer App isn't exempt. So the task text tells the agent to record its review in the commit body, and the body quotes every commit past the base, oldest first, after the plan.
+    - The messages pass the same closer rewrite and attribution rules as the plan (decision 22).
+    - They are capped at 16000 bytes, and the plan gets what is left of its own cap. GitHub refuses a body over 65536 characters, and the review sits at the end of a commit body, where a cut would take it.
+    - In run 2 nothing in the body could have carried the review, so even a perfect run would have failed CI.
 
 ## Where steps 4–6 and 8 attach
 

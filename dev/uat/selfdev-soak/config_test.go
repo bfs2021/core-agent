@@ -158,11 +158,18 @@ func checkApprover(t *testing.T, cfg *config.Config) {
 		t.Errorf("eligible_bundles = %v, want [coding]; the agent never pushes (decision 7), so no github preset", p.Auto.EligibleBundles)
 	}
 	// Exact, not a superset check: a widened pattern ("bash:*") hands the
-	// approver calls the design never made eligible. The three address
-	// the per-issue copies under the dispatcher's --worktrees-dir, which
-	// is how the task text tells the agent to work (dispatcher/task.go).
-	if want := []string{"bash:go -C /workspace/issues/*", "bash:git -C /workspace/issues/*", "bash:/workspace/issues/*"}; !reflect.DeepEqual(p.Auto.Eligible, want) {
+	// approver calls the design never made eligible. The bash three
+	// address the per-issue copies under the dispatcher's
+	// --worktrees-dir, which is how the task text tells the agent to work
+	// (dispatcher/task.go); the fourth is the recipe's own reviewer.
+	if want := []string{"bash:go -C /workspace/issues/*", "bash:git -C /workspace/issues/*", "bash:/workspace/issues/*", "spawn_agent:reviewer"}; !reflect.DeepEqual(p.Auto.Eligible, want) {
 		t.Errorf("eligible = %v, want exactly %v (The auto recipe)", p.Auto.Eligible, want)
+	}
+	// Nobody answers prompts during A7, so a call auto would hand to a
+	// person is refused at once, with the reason, instead of waiting out
+	// approval_timeout (docs/auto-mode-unattended-design.md).
+	if !p.Auto.RefusesEscalation() {
+		t.Errorf("escalation = %q, want %q (The auto recipe)", p.Auto.Escalation, config.AutoEscalationRefuse)
 	}
 	// Validate does not resolve bundle names; startup does, through this.
 	if _, err := permissions.ResolveAutoEligible(p.Auto.Eligible, p.Auto.EligibleBundles); err != nil {
