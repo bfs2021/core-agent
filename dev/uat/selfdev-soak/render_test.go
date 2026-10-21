@@ -187,7 +187,11 @@ type volume struct {
 		DefaultMode *int   `yaml:"defaultMode"`
 	} `yaml:"secret"`
 	ConfigMap *struct {
-		Name string `yaml:"name"`
+		Name  string `yaml:"name"`
+		Items []struct {
+			Key  string `yaml:"key"`
+			Path string `yaml:"path"`
+		} `yaml:"items"`
 	} `yaml:"configMap"`
 	PersistentVolumeClaim *struct {
 		ClaimName string `yaml:"claimName"`
@@ -605,6 +609,52 @@ func TestSlackReplacementIndexMatchesConfig(t *testing.T) {
 	}
 }
 
+// In A7's third run the approver passed the agent's commit to a person
+// because it could not read the commit message file, and under
+// escalation "refuse" that ended the run. The approver's instructions
+// for this deployment say why that is not a reason to escalate. They
+// only take effect if the path in config.json is a file the daemon
+// actually has: a missing instructions_file is a startup error.
+func TestRenderMountsApproverInstructions(t *testing.T) {
+	r := renderGood(t)
+	cm := r.configMap(t, slackTargetName)
+	cfg, err := loadLikeDashC([]byte(cm.Data["config.json"]))
+	if err != nil {
+		t.Fatalf("rendered config.json does not load like -c: %v", err)
+	}
+	path := cfg.Permissions.Auto.InstructionsFile
+	dir, key := filepath.Split(path)
+	if filepath.Clean(dir) != "/etc/core-agent-soak" {
+		t.Fatalf("instructions_file %q is not in the config mount /etc/core-agent-soak", path)
+	}
+	want, err := os.ReadFile("approver-instructions.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cm.Data[key] != string(want) {
+		t.Errorf("the config ConfigMap's %q is not approver-instructions.md", key)
+	}
+	v, ok := r.pod(t, "Deployment/core-agent-selfdev").volume("config")
+	if !ok || v.ConfigMap == nil {
+		t.Fatal("daemon has no config volume from a ConfigMap")
+	}
+	mounted := false
+	for _, it := range v.ConfigMap.Items {
+		if it.Key == key && it.Path == key {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Errorf("the daemon's config volume does not project %q, so %s would not exist", key, path)
+	}
+	// The text names the commit command the task text gives the agent.
+	for _, s := range []string{".git/SOAK_COMMIT_MSG", "`reviewer` tool"} {
+		if !strings.Contains(string(want), s) {
+			t.Errorf("approver-instructions.md no longer mentions %s", s)
+		}
+	}
+}
+
 func TestRenderSubstitutesSlackChannel(t *testing.T) {
 	r := renderGood(t)
 	cm := r.configMap(t, slackTargetName)
@@ -688,7 +738,7 @@ func TestDeployFailsClosedWithoutRenderScript(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err == nil {
 		t.Fatalf("kustomize build deploy/base succeeded without inputs.env; a direct apply would deploy placeholders:\n%.400s", out)
 	}
-	for _, f := range []string{"inputs.env", "config.soak.json"} {
+	for _, f := range []string{"inputs.env", "config.soak.json", "approver-instructions.md"} {
 		if _, err := os.Stat(filepath.Join(deployDir, "base", f)); err == nil {
 			t.Errorf("deploy/base/%s exists in the tree; it must be supplied by render.sh only", f)
 		}

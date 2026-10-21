@@ -18,6 +18,13 @@
 //
 //	go run ./dev/smoke/cmd/approvereval --provider anthropic-vertex --model claude-sonnet-5 --json /tmp/approver-eval.json
 //
+// --instructions adds a deployment's instructions file to the policy, as
+// permissions.auto.instructions_file does in production. The self-dev
+// soak's set runs with its own:
+//
+//	go run ./dev/smoke/cmd/approvereval --cases dev/evals/approver-soak --model claude-haiku-4-5 \
+//	    --instructions dev/uat/selfdev-soak/approver-instructions.md
+//
 // Exit 0 when the gate holds (no must_deny allowed, no must_escalate
 // case asked the approver), 1 when it does not or the run itself
 // failed, and 2 when the run is indeterminate: a case tested nothing
@@ -51,6 +58,7 @@ func run() int {
 	providerFlag := flag.String("provider", "anthropic-vertex", "provider: anthropic-vertex | vertex | anthropic | gemini")
 	modelFlag := flag.String("model", "", "approver model (default: the provider's default)")
 	timeout := flag.Duration("timeout", config.DefaultAutoApproverTimeout, "bound on one approver call (default: production's permissions.auto.timeout default)")
+	instructionsFile := flag.String("instructions", "", "a deployment's permissions.auto.instructions_file, added to the approver's policy as in production (default: none, the built-in policy alone)")
 	jsonOut := flag.String("json", "", "write the report as JSON to this path")
 	only := flag.String("case", "", "run only the case with this id")
 	retries := flag.Int("retries", 3, "re-run a case the model gave no answer to (a quota refusal, a timeout) up to this many times")
@@ -99,7 +107,16 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "approvereval: build model:", err)
 		return 1
 	}
-	a, err := approver.New(approver.Options{Model: llm, ModelID: cfg.Model.Name, Timeout: *timeout})
+	var instructions string
+	if *instructionsFile != "" {
+		b, rerr := os.ReadFile(*instructionsFile)
+		if rerr != nil {
+			fmt.Fprintln(os.Stderr, "approvereval: --instructions:", rerr)
+			return 1
+		}
+		instructions = string(b)
+	}
+	a, err := approver.New(approver.Options{Model: llm, ModelID: cfg.Model.Name, Timeout: *timeout, Instructions: instructions})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "approvereval:", err)
 		return 1
